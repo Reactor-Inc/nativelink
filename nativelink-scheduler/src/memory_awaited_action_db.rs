@@ -447,12 +447,34 @@ impl<I: InstantWrapper, NowFn: Fn() -> I + Clone + Send + Sync> AwaitedActionDbI
                             sort_key,
                             operation_id: operation_id.clone(),
                         });
-                    if maybe_sorted_awaited_action.is_none() {
-                        error!(
-                            %operation_id,
-                            ?sort_key,
-                            "Expected maybe_sorted_awaited_action to have {sort_key:?}",
-                        );
+                    match maybe_sorted_awaited_action {
+                        None => {
+                            error!(
+                                %operation_id,
+                                ?sort_key,
+                                "Expected maybe_sorted_awaited_action to have {sort_key:?}",
+                            );
+                        }
+                        Some(_) => {
+                            // DEVPROD-791: dropping a still-tracked action here is
+                            // NOT a stage transition, so update_awaited_action
+                            // never runs and execution.active.count is never
+                            // decremented for it -- the gauge leaks (queued /
+                            // executing / completed accumulate for the process
+                            // lifetime). Pair a -1 for the action's current stage
+                            // with the successful take() from that stage's BTree,
+                            // restoring the invariant that per-stage active_count
+                            // tracks per-stage BTree membership (established by
+                            // add_action's +1 Queued and update_awaited_action's
+                            // -1 old / +1 new). Gated on Some so a double-drop
+                            // (take() -> None) cannot over-decrement.
+                            let metrics = &*EXECUTION_METRICS;
+                            let stage_attrs = vec![opentelemetry::KeyValue::new(
+                                nativelink_util::metrics::EXECUTION_STAGE,
+                                ExecutionStage::from(&awaited_action.state().stage),
+                            )];
+                            metrics.execution_active_count.add(-1, &stage_attrs);
+                        }
                     }
                 }
                 ActionEvent::ClientKeepAlive(client_id) => {
