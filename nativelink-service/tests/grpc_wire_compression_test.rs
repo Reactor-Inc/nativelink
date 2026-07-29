@@ -609,9 +609,14 @@ async fn compressed_upload_returns_after_early_completion()
 // download must keep the already-decoded prefix and ask the identity path for
 // exactly the undelivered tail — not re-fetch from zero, and not request a
 // range that runs past the end of the blob.
-#[nativelink_test]
-async fn interrupted_compressed_download_resumes_via_identity()
--> Result<(), Box<dyn core::error::Error>> {
+//
+// `requested_length` is the caller's `length` argument. Both accepted forms
+// matter: `None` (read to end) and an explicit limit that covers the blob,
+// which is the form that made the resumed request over-request past the end
+// and rely on the server clamping it.
+async fn assert_interrupted_download_resumes(
+    requested_length: Option<u64>,
+) -> Result<(), Box<dyn core::error::Error>> {
     use nativelink_proto::build::bazel::remote::execution::v2::compressor;
 
     let (content, digest) = make_mixed_content(0x44, 8 * 1024 * 1024);
@@ -642,7 +647,7 @@ async fn interrupted_compressed_download_resumes_via_identity()
 
     let fetched = tokio::time::timeout(
         core::time::Duration::from_secs(10),
-        grpc_store.get_part_unchunked(digest, 0, None),
+        grpc_store.get_part_unchunked(digest, 0, requested_length),
     )
     .await
     .expect("interrupted compressed read must not hang")?;
@@ -668,6 +673,18 @@ async fn interrupted_compressed_download_resumes_via_identity()
         "the resume range must cover exactly the undelivered tail",
     );
     Ok(())
+}
+
+#[nativelink_test]
+async fn interrupted_compressed_download_resumes_via_identity()
+-> Result<(), Box<dyn core::error::Error>> {
+    assert_interrupted_download_resumes(None).await
+}
+
+#[nativelink_test]
+async fn interrupted_compressed_download_resumes_with_explicit_length()
+-> Result<(), Box<dyn core::error::Error>> {
+    assert_interrupted_download_resumes(Some(8 * 1024 * 1024)).await
 }
 
 // W5: a download whose consumer goes away must fail, not trigger a pointless
