@@ -53,13 +53,11 @@ build --remote_timeout=600
 build --remote_executor=grpcs://TODO
 ```
 
-Three ways to fill in `TODO` — [Local Remote Execution → Point
+Two ways to fill in `TODO` — [Local Remote Execution → Point
 `user.bazelrc` at a real cache and executor](/rbe/local-remote-execution)
 has a worked, filled-in example of the file below, whichever option
 you pick:
 
-- **[dev.nativelink.com](https://dev.nativelink.com)** — paste your
-  cloud credentials, use `grpcs://`.
 - **A self-hosted cluster** — your own endpoint, `grpcs://` if it
   terminates TLS.
 - **Nothing but your own machine** — drop the `s`, point both
@@ -106,6 +104,23 @@ modifications:
 - Pin to a specific NativeLink commit (`inputs.nativelink.url` in
   `flake.nix`, kept in sync with the `local-remote-execution` module
   override in `MODULE.bazel`).
+
+## FAQ
+
+<Accordions type="multiple">
+  <Accordion title="What is Nix, and why does the template depend on it?" id="what-is-nix-and-why-does-the-template-depend-on-it">
+    A package manager that builds everything in isolation and addresses
+    results by a hash of all inputs — your `clang` lives at
+    `/nix/store/<hash>-clang-.../bin/clang`. That hash-pinned path is
+    exactly what LRE needs to make action hashes identical across
+    machines.
+  </Accordion>
+  <Accordion title="What does adopting Nix cost?" id="what-does-adopting-nix-cost">
+    A learning curve (an unfamiliar language, terse error messages) and
+    the first `nix develop`, which downloads the full toolchain — about
+    5 GB for this template. After that, entering the shell is instant.
+  </Accordion>
+</Accordions>
 
 ## What's next
 

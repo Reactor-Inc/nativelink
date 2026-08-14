@@ -153,8 +153,8 @@ pub enum StoreSpec {
     ///   }
     ///   ```
     ///
-    /// 4. **`NetApp` ONTAP S3**
-    ///    `NetApp` ONTAP S3 store will use ONTAP's S3-compatible storage as a backend
+    /// 4. **NetApp ONTAP S3:**
+    ///    NetApp ONTAP S3 store will use ONTAP's S3-compatible storage as a backend
     ///    to store files. This store is specifically configured for ONTAP's S3 requirements
     ///    including custom TLS configuration, credentials management, and proper vserver
     ///    configuration.
@@ -315,7 +315,7 @@ pub enum StoreSpec {
     /// is a concern it is often faster and more efficient to use this
     /// store before those stores.
     ///
-    /// **Example JSON Config:**
+    /// **LZ4 example:**
     /// ```json
     /// "compression": {
     ///   "compression_algorithm": {
@@ -326,12 +326,49 @@ pub enum StoreSpec {
     ///       "content_path": "/tmp/nativelink/data/content_path-cas",
     ///       "temp_path": "/tmp/nativelink/data/tmp_path-cas",
     ///       "eviction_policy": {
-    ///         "max_bytes": "2gb",
+    ///         "max_bytes": "2gb"
     ///       }
     ///     }
     ///   }
     /// }
     /// ```
+    ///
+    /// **Zstd example:**
+    /// ```json
+    /// "compression": {
+    ///   "compression_algorithm": {
+    ///     "zstd": {
+    ///       "temp_path": "/var/tmp/nativelink-zstd",
+    ///       "max_compressed_upload_size": "512MiB",
+    ///       "max_concurrent_staged_uploads": 4,
+    ///       "max_concurrent_identity_ops": 256,
+    ///       "compression_level": 9,
+    ///       "max_recompression_size": "64MiB",
+    ///       "max_concurrent_recompressions": 1,
+    ///       "max_inline_commit_size": "4MiB",
+    ///       "stage_timeout_s": 600,
+    ///       "commit_timeout_s": 300
+    ///     }
+    ///   },
+    ///   "backend": {
+    ///     "memory": {
+    ///       "eviction_policy": { "max_bytes": "10GiB" }
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// The `zstd` algorithm keeps CAS blobs as zstd streams at rest and serves them
+    /// byte-for-byte to `--remote_cache_compression` clients. Its `backend` MUST be
+    /// a new or empty dedicated namespace, never shared with processes that read or
+    /// write the same keys as raw bytes. Rollout and rollback require a cache flush
+    /// or new namespace — there is no in-place migration.
+    ///
+    /// For byte-for-byte passthrough, this compression store must be the store the
+    /// instance points at directly. `fast_slow`, `dedup`, `existence_cache`,
+    /// `cache_metrics`, `shard`, `ref`, and `size_partitioning` may appear **inside**
+    /// its `backend`. Any wrapper **outside** it is correct but disables passthrough
+    /// at that boundary.
     ///
     Compression(Box<CompressionSpec>),
 
@@ -438,7 +475,7 @@ pub enum StoreSpec {
     /// WARNING: If you need data to always exist in the `slow` store
     /// for something like remote execution, be careful because this
     /// store will never check to see if the objects exist in the
-    /// `slow` store if it exists in the `fast` store (ie: it assumes
+    /// `slow` store if it exists in the `fast` store (i.e. it assumes
     /// that if an object exists in the `fast` store it will exist in
     /// the `slow` store).
     ///
@@ -531,7 +568,7 @@ pub enum StoreSpec {
     /// used if the size field is the real size of the content, in other
     /// words, don't use on AC (Action Cache) stores. Any store where you can
     /// safely use `VerifySpec.verify_size = true`, this store should be safe
-    /// to use (ie: CAS stores).
+    /// to use (i.e. CAS stores).
     ///
     /// **Example JSON Config:**
     /// ```json
@@ -553,7 +590,7 @@ pub enum StoreSpec {
     ///
     SizePartitioning(Box<SizePartitioningSpec>),
 
-    /// This store will pass-through calls to another GRPC store. This store
+    /// This store will pass-through calls to another gRPC store. This store
     /// is not designed to be used as a sub-store of another store, but it
     /// does satisfy the interface and will likely work.
     ///
@@ -592,6 +629,12 @@ pub enum StoreSpec {
     /// Pairs well with `SizePartitioning` and/or `FastSlow` stores.
     /// Ideal for accepting small object sizes as most redis store
     /// services have a max file upload of between 256Mb-512Mb.
+    ///
+    /// If you are using Redis together with any stores above it
+    /// e.g. existence cache, you will need to configure `notify-keyspace-events`
+    /// to `KA` as per <https://redis.io/docs/latest/develop/pubsub/keyspace-notifications/#configuration>
+    /// in order for us to get eviction events. Failing to do so will get you
+    /// log messages complaining about it, as well as errors like <https://github.com/TraceMachina/nativelink/issues/2436>
     ///
     /// **Example JSON Config:**
     /// ```json
@@ -638,6 +681,86 @@ pub enum StoreSpec {
     /// ```
     ///
     ExperimentalMongo(ExperimentalMongoSpec),
+}
+
+impl StoreSpec {
+    pub(crate) fn visit_grpc_specs(&self, visitor: &mut dyn FnMut(&GrpcSpec)) {
+        match self {
+            Self::CacheMetrics(spec) => spec.backend.visit_grpc_specs(visitor),
+            Self::Verify(spec) => spec.backend.visit_grpc_specs(visitor),
+            Self::Compression(spec) => spec.backend.visit_grpc_specs(visitor),
+            Self::Dedup(spec) => {
+                spec.index_store.visit_grpc_specs(visitor);
+                spec.content_store.visit_grpc_specs(visitor);
+            }
+            Self::ExistenceCache(spec) => spec.backend.visit_grpc_specs(visitor),
+            Self::CompletenessChecking(spec) => {
+                spec.backend.visit_grpc_specs(visitor);
+                spec.cas_store.visit_grpc_specs(visitor);
+            }
+            Self::FastSlow(spec) => {
+                spec.fast.visit_grpc_specs(visitor);
+                spec.slow.visit_grpc_specs(visitor);
+            }
+            Self::Shard(spec) => {
+                for shard in &spec.stores {
+                    shard.store.visit_grpc_specs(visitor);
+                }
+            }
+            Self::SizePartitioning(spec) => {
+                spec.lower_store.visit_grpc_specs(visitor);
+                spec.upper_store.visit_grpc_specs(visitor);
+            }
+            Self::Grpc(spec) => visitor(spec),
+            Self::Memory(_)
+            | Self::ExperimentalCloudObjectStore(_)
+            | Self::OntapS3ExistenceCache(_)
+            | Self::Filesystem(_)
+            | Self::RefStore(_)
+            | Self::RedisStore(_)
+            | Self::Noop(_)
+            | Self::ExperimentalMongo(_) => {}
+        }
+    }
+
+    pub(crate) fn visit_grpc_specs_mut(&mut self, visitor: &mut dyn FnMut(&mut GrpcSpec)) {
+        match self {
+            Self::CacheMetrics(spec) => spec.backend.visit_grpc_specs_mut(visitor),
+            Self::Verify(spec) => spec.backend.visit_grpc_specs_mut(visitor),
+            Self::Compression(spec) => spec.backend.visit_grpc_specs_mut(visitor),
+            Self::Dedup(spec) => {
+                spec.index_store.visit_grpc_specs_mut(visitor);
+                spec.content_store.visit_grpc_specs_mut(visitor);
+            }
+            Self::ExistenceCache(spec) => spec.backend.visit_grpc_specs_mut(visitor),
+            Self::CompletenessChecking(spec) => {
+                spec.backend.visit_grpc_specs_mut(visitor);
+                spec.cas_store.visit_grpc_specs_mut(visitor);
+            }
+            Self::FastSlow(spec) => {
+                spec.fast.visit_grpc_specs_mut(visitor);
+                spec.slow.visit_grpc_specs_mut(visitor);
+            }
+            Self::Shard(spec) => {
+                for shard in &mut spec.stores {
+                    shard.store.visit_grpc_specs_mut(visitor);
+                }
+            }
+            Self::SizePartitioning(spec) => {
+                spec.lower_store.visit_grpc_specs_mut(visitor);
+                spec.upper_store.visit_grpc_specs_mut(visitor);
+            }
+            Self::Grpc(spec) => visitor(spec),
+            Self::Memory(_)
+            | Self::ExperimentalCloudObjectStore(_)
+            | Self::OntapS3ExistenceCache(_)
+            | Self::Filesystem(_)
+            | Self::RefStore(_)
+            | Self::RedisStore(_)
+            | Self::Noop(_)
+            | Self::ExperimentalMongo(_) => {}
+        }
+    }
 }
 
 /// Configuration for an individual shard of the store.
@@ -707,7 +830,7 @@ pub struct RefSpec {
 pub struct FilesystemSpec {
     /// Path on the system where to store the actual content. This is where
     /// the bulk of the data will be placed.
-    /// On service bootup this folder will be scanned and all files will be
+    /// On service boot this folder will be scanned and all files will be
     /// added to the cache. In the event one of the files doesn't match the
     /// criteria, the file will be deleted.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
@@ -716,7 +839,7 @@ pub struct FilesystemSpec {
     /// A temporary location of where files that are being uploaded or
     /// deleted will be placed while the content cannot be guaranteed to be
     /// accurate. This location must be on the same block device as
-    /// `content_path` so atomic moves can happen (ie: move without copy).
+    /// `content_path` so atomic moves can happen (i.e. move without copy).
     /// All files in this folder will be deleted on every startup.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub temp_path: String,
@@ -748,6 +871,16 @@ pub struct FilesystemSpec {
     /// Default: unlimited
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_concurrent_writes: usize,
+
+    /// When true, advise the kernel to drop the page cache for each blob after
+    /// it is written or read (`posix_fadvise` with `POSIX_FADV_DONTNEED`). On
+    /// real filesystems this takes a globally serialized, all-CPU kernel path
+    /// that stalls on many-core hosts, and it evicts the page-cache tier that
+    /// fast-disk deployments rely on. Leave off unless you specifically want to
+    /// keep this store's I/O out of the page cache.
+    /// Default: false
+    #[serde(default)]
+    pub evict_page_cache: bool,
 }
 
 // NetApp ONTAP S3 Spec
@@ -883,7 +1016,7 @@ pub struct FastSlowSpec {
     /// out to the `slow` store.
     pub fast: StoreSpec,
 
-    /// How to handle the fast store.  This can be useful to set to Get for
+    /// How to handle the fast store. This can be useful to set to Get for
     /// worker nodes such that results are persisted to the slow store only.
     #[serde(default)]
     pub fast_direction: StoreDirection,
@@ -892,7 +1025,7 @@ pub struct FastSlowSpec {
     /// get it from this store.
     pub slow: StoreSpec,
 
-    /// How to handle the slow store.  This can be useful if creating a diode
+    /// How to handle the slow store. This can be useful if creating a diode
     /// and you wish to have an upstream read only store.
     #[serde(default)]
     pub slow_direction: StoreDirection,
@@ -963,7 +1096,7 @@ pub struct DedupSpec {
     /// Due to implementation detail, we want to prefer to download
     /// the first chunks of the file so we can stream the content
     /// out and free up some of our buffers. This configuration
-    /// will be used to to restrict the number of concurrent chunk
+    /// will be used to restrict the number of concurrent chunk
     /// downloads at a time per `get()` request.
     ///
     /// This setting will also affect how much memory might be used
@@ -1055,7 +1188,7 @@ pub struct Lz4Config {
     pub max_decode_block_size: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub enum CompressionAlgorithm {
@@ -1067,6 +1200,11 @@ pub enum CompressionAlgorithm {
     ///
     /// see: <https://lz4.github.io/lz4/>
     Lz4(Lz4Config),
+
+    /// Zstd compression keeps blobs as standard zstd streams at rest. When this
+    /// compression store is directly configured for an instance, zstd wire-compression
+    /// clients can receive the stored stream byte-for-byte.
+    Zstd(ZstdConfig),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1084,6 +1222,89 @@ pub struct CompressionSpec {
     pub compression_algorithm: CompressionAlgorithm,
 }
 
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct ZstdConfig {
+    /// Operator-controlled staging directory for validation. Put it on the same
+    /// filesystem as the `content_path` of a `filesystem` backend: that backend
+    /// commits by `rename(2)`, which fails with `EXDEV` across filesystems.
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub temp_path: String,
+
+    /// Max compressed wire bytes accepted by an upload. Exceeding it returns
+    /// `RESOURCE_EXHAUSTED`. Accepts "512MiB"-style strings.
+    #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    pub max_compressed_upload_size: u64,
+
+    /// Max uploads holding staging files at once. `0` means "use default 4"
+    /// at construction time.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub max_concurrent_staged_uploads: usize,
+
+    /// Max concurrent uncompressed (identity) reads and writes this store will
+    /// admit. Each one occupies a blocking thread for the whole transfer, so
+    /// this bound keeps a flood of slow identity clients from starving the
+    /// process-wide blocking pool that filesystem I/O also uses. `0` means "use
+    /// default 256" at construction time.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub max_concurrent_identity_ops: usize,
+
+    /// Level used to encode uploads this store compresses itself (identity
+    /// uploads) and, when `max_recompression_size > 0`, to re-encode incoming
+    /// compressed uploads. Omitted uses level 3. Validated `1..=19` at startup.
+    pub compression_level: Option<i32>,
+
+    /// Max uncompressed blob size eligible for optional recompression of an
+    /// already-compressed upload. `0` disables recompression. Requires
+    /// `compression_level` to be set; a positive value without it is rejected
+    /// at startup rather than silently doing nothing.
+    #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    pub max_recompression_size: u64,
+
+    /// Concurrent recompressions admitted by this store. Recompression is
+    /// best-effort: an upload that finds every slot busy commits the client's
+    /// original stream instead of queueing behind them, so this never blocks a
+    /// staging slot. `0` means "use default 1" at construction time.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub max_concurrent_recompressions: usize,
+
+    /// Maximum time, in seconds, one upload may spend being validated and
+    /// staged, measured from the moment it is admitted to a staging slot. Unlike
+    /// a per-message idle timeout, continuous slow progress does not reset it.
+    /// On expiry it fails with `DEADLINE_EXCEEDED`; the non-cancellable blocking
+    /// validator retains its slot and staged-file cleanup guard until its input
+    /// closes and it exits, so callers must promptly close the input after the
+    /// failure. Size it against `max_compressed_upload_size` and the slowest
+    /// upload bandwidth worth serving.
+    /// `0` means "use default 600" at construction time.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub stage_timeout_s: u64,
+
+    /// Maximum time, in seconds, allowed for the optional recompression of a
+    /// staged upload plus its inner-store commit. The timer starts after the
+    /// client stream has finished validation and staging, so it does not reject
+    /// a steadily progressing large upload. On expiry it fails with
+    /// `DEADLINE_EXCEEDED`, removes the staged file, and releases its slot.
+    /// `0` means "use default 300" at construction time.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub commit_timeout_s: u64,
+
+    /// Compressed uploads at or below this many bytes are validated and
+    /// committed straight from memory, with no staging file and no `fsync`.
+    /// `BatchUpdateBlobs` payloads are small and numerous, so writing each one
+    /// to disk would dominate their cost. Larger uploads always stage to
+    /// `temp_path`. `0` means "use default 4MiB" at construction time.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    pub max_inline_commit_size: u64,
+}
+
 /// Eviction policy always works on LRU (Least Recently Used). Any time an entry
 /// is touched it updates the timestamp. Inserts and updates will execute the
 /// eviction policy removing any expired entries and/or the oldest entries
@@ -1098,7 +1319,7 @@ pub struct EvictionPolicy {
     pub max_bytes: usize,
 
     /// When eviction starts based on hitting `max_bytes`, continue until
-    /// `max_bytes - evict_bytes` is met to create a low watermark.  This stops
+    /// `max_bytes - evict_bytes` is met to create a low watermark. This stops
     /// operations from thrashing when the store is close to the limit.
     /// Default: 0
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
@@ -1274,10 +1495,10 @@ pub struct CommonObjectSpec {
     #[serde(default, deserialize_with = "convert_boolean_with_shellexpand")]
     pub insecure_allow_http: bool,
 
-    /// Disable http/2 connections and only use http/1.1. Default client
-    /// configuration will have http/1.1 and http/2 enabled for connection
-    /// schemes. Http/2 should be disabled if environments have poor support
-    /// or performance related to http/2. Safe to keep default unless
+    /// Disable HTTP/2 connections and only use HTTP/1.1. Default client
+    /// configuration will have HTTP/1.1 and HTTP/2 enabled for connection
+    /// schemes. HTTP/2 should be disabled if environments have poor support
+    /// or performance related to HTTP/2. Safe to keep default unless
     /// underlying network environment, S3, or GCS API servers specify otherwise.
     ///
     /// Default: false
@@ -1327,7 +1548,7 @@ pub struct ClientTlsConfig {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct GrpcEndpoint {
-    /// The endpoint address (i.e. grpc(s)://example.com:443).
+    /// The endpoint address (i.e. `grpc(s)://example.com:443`).
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub address: String,
     /// The TLS configuration to use to connect to the endpoint (if grpcs).
@@ -1367,7 +1588,7 @@ pub struct GrpcEndpoint {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct GrpcSpec {
-    /// Instance name for GRPC calls. Proxy calls will have the `instance_name` changed to this.
+    /// Instance name for gRPC calls. Proxy calls will have the `instance_name` changed to this.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub instance_name: String,
 
@@ -1381,19 +1602,20 @@ pub struct GrpcSpec {
     #[serde(default)]
     pub retry: Retry,
 
-    /// Limit the number of simultaneous upstream requests to this many.  A
-    /// value of zero is treated as unlimited.  If the limit is reached the
+    /// Limit the number of simultaneous upstream requests to this many. A
+    /// value of zero is treated as unlimited. If the limit is reached the
     /// request is queued.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_concurrent_requests: usize,
 
     /// The number of connections to make to each specified endpoint to balance
-    /// the load over multiple TCP connections.  Default 1.
+    /// the load over multiple TCP connections.
+    /// Default: 1.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub connections_per_endpoint: usize,
 
     /// Maximum time (seconds) allowed for a single RPC request (e.g. a
-    /// ByteStream.Write call) before it is cancelled.
+    /// `ByteStream.Write` call) before it is cancelled.
     ///
     /// A value of 0 (the default) disables the per-RPC timeout. Dead
     /// connections are still detected by the HTTP/2 and TCP keepalive
@@ -1439,6 +1661,130 @@ pub struct GrpcSpec {
     /// context (`traceparent` / `tracestate`) into every outgoing request.
     #[serde(default)]
     pub forward_headers: Vec<String>,
+
+    /// Optional and experimental: coalesce small-blob reads into
+    /// `BatchReadBlobs` RPCs instead of issuing one `ByteStream` `Read`
+    /// stream per blob. Each `ByteStream` read carries a fixed per-RPC cost,
+    /// so batching many small reads into a single `BatchReadBlobs` request
+    /// can dramatically reduce read latency for small blobs.
+    ///
+    /// Only full reads (offset 0, whole blob) of blobs at or below
+    /// `max_blob_size_bytes` are batched; everything else continues to use
+    /// the `ByteStream` `Read` path.
+    ///
+    /// Incompatible with `forward_headers`: batched reads share one upstream
+    /// RPC across many client requests, so per-client forwarded headers
+    /// (e.g. credentials) cannot be attached. Configuring both is rejected
+    /// at startup.
+    ///
+    /// Default: unset (disabled). When unset there is zero behavior change.
+    #[serde(default)]
+    pub experimental_read_batching: Option<GrpcReadBatchingConfig>,
+
+    /// Compress this store's own blob transfers on the wire with REAPI
+    /// `compressed-blobs/zstd`. Uploads and full-blob downloads of blobs at
+    /// or above 64 KiB are zstd-compressed; smaller blobs and ranged reads
+    /// keep the identity path.
+    ///
+    /// The upstream instance must have
+    /// `capabilities.remote_cache_compression` enabled, otherwise compressed
+    /// requests fail with `InvalidArgument`. This setting is what makes
+    /// NativeLink-to-NativeLink hops (for example worker to CAS) benefit
+    /// from wire compression; it is independent of what external clients
+    /// such as Bazel negotiate for themselves.
+    ///
+    /// Compressed uploads do not resume mid-stream (mirroring the REAPI
+    /// server contract): a transport failure part-way through a compressed
+    /// upload surfaces immediately to the caller instead of retrying, and
+    /// outer callers retry the whole upload.
+    ///
+    /// When combined with `experimental_chunked_uploads`, chunked uploads
+    /// take precedence for blobs at or above the chunking threshold.
+    ///
+    /// When zstd wire compression is enabled elsewhere in the process,
+    /// omitting this setting enables it automatically for CAS gRPC stores.
+    /// Set it explicitly to `false` to opt this store out.
+    ///
+    /// Default: inherited from the process-wide zstd wire-compression intent.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "convert_boolean_with_shellexpand"
+    )]
+    pub experimental_remote_cache_compression: Option<bool>,
+}
+
+impl GrpcSpec {
+    /// Whether this store should use REAPI zstd wire compression.
+    #[must_use]
+    pub fn remote_cache_compression_enabled(&self) -> bool {
+        self.experimental_remote_cache_compression.unwrap_or(false)
+    }
+}
+
+/// Configuration for experimental small-blob read coalescing in a gRPC
+/// store. See [`GrpcSpec::experimental_read_batching`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct GrpcReadBatchingConfig {
+    /// Only blobs at or below this size (in bytes) are eligible for
+    /// batching. Larger blobs always use the `ByteStream` `Read` path.
+    ///
+    /// Default: 131072 (128 KiB).
+    #[serde(
+        default = "default_read_batching_max_blob_size_bytes",
+        deserialize_with = "convert_data_size_with_shellexpand"
+    )]
+    pub max_blob_size_bytes: u64,
+
+    /// Maximum total payload bytes packed into a single `BatchReadBlobs`
+    /// request. This should leave headroom under the 4 MiB default gRPC
+    /// message limit for protobuf framing overhead.
+    ///
+    /// Default: 3145728 (3 MiB).
+    #[serde(
+        default = "default_read_batching_max_batch_bytes",
+        deserialize_with = "convert_data_size_with_shellexpand"
+    )]
+    pub max_batch_bytes: u64,
+
+    /// Maximum number of concurrent `BatchReadBlobs` RPCs dispatched by the
+    /// coalescer. Must be greater than zero.
+    ///
+    /// Default: 4.
+    #[serde(
+        default = "default_read_batching_dispatch_slots",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub dispatch_slots: usize,
+
+    /// Bound on the number of payload bytes waiting in the coalescer queue.
+    /// When exceeded, new read requests bypass batching and fall back to the
+    /// regular `ByteStream` `Read` path instead of blocking.
+    ///
+    /// Default: 33554432 (32 MiB).
+    #[serde(
+        default = "default_read_batching_max_queued_bytes",
+        deserialize_with = "convert_data_size_with_shellexpand"
+    )]
+    pub max_queued_bytes: u64,
+}
+
+const fn default_read_batching_max_blob_size_bytes() -> u64 {
+    128 * 1024 // 128 KiB.
+}
+
+const fn default_read_batching_max_batch_bytes() -> u64 {
+    3 * 1024 * 1024 // 3 MiB.
+}
+
+const fn default_read_batching_dispatch_slots() -> usize {
+    4
+}
+
+const fn default_read_batching_max_queued_bytes() -> u64 {
+    32 * 1024 * 1024 // 32 MiB.
 }
 
 /// The possible error codes that might occur on an upstream request.
@@ -1558,18 +1904,42 @@ pub struct RedisSpec {
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub read_chunk_size: usize,
 
-    /// The number of connections to keep open to the redis server(s).
+    /// The number of connections to keep open to the redis servers.
     ///
     /// Default: 3
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub connection_pool_size: usize,
+
+    /// Expire keys written by this store after this many seconds.
+    ///
+    /// Redis does not expire these on its own, so a store whose consumer
+    /// stops keeps every key it ever wrote. A BEP store is the case this
+    /// exists for: if the ETL stops consuming, the backlog grows until the
+    /// Redis node runs out of memory.
+    ///
+    /// Set this per store, not globally. The same store type backs the CAS
+    /// fast tier and the scheduler, and expiring scheduler state would drop
+    /// in-flight actions.
+    ///
+    /// This trades data for a bound. Anything not consumed within the window
+    /// is deleted, so the value has to exceed the longest consumer outage you
+    /// intend to survive, and it must also exceed how long a single upload can
+    /// take: the temp key an upload builds carries this same TTL, so a value
+    /// below the upload duration would expire the write in flight.
+    ///
+    /// Zero disables expiry. One second is the smallest value that enables it,
+    /// and any value that small is almost certainly a mistake.
+    ///
+    /// Default: 0 (keys never expire)
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub key_ttl_s: u64,
 
     /// The maximum number of upload chunks to allow per update.
     /// This is used to limit the amount of memory used when uploading
     /// large objects to the redis server. A good rule of thumb is to
     /// think of the data as:
     /// `AVAIL_MEMORY / (read_chunk_size * max_chunk_uploads_per_update) = THORETICAL_MAX_CONCURRENT_UPLOADS`
-    /// (note: it is a good idea to divide `AVAIL_MAX_MEMORY` by ~10 to account for other memory usage)
+    /// (note: it's a good idea to divide `AVAIL_MAX_MEMORY` by ~10 to account for other memory usage)
     ///
     /// Default: 10
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
@@ -1663,8 +2033,8 @@ pub struct Retry {
     #[serde(default)]
     pub jitter: f32,
 
-    /// A list of error codes to retry on, if this is not set then the default
-    /// error codes to retry on are used.  These default codes are the most
+    /// A list of error codes to retry on, if this isn't set then the default
+    /// error codes to retry on are used. These default codes are the most
     /// likely to be non-permanent.
     ///  - `Unknown`
     ///  - `Cancelled`
@@ -1773,5 +2143,55 @@ impl Retry {
                 delay.mul_f32(local_jitter.mul_add(rand::rng().random::<f32>() - 0.5, 1.))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zstd_compression_algorithm_parses_and_defaults() {
+        let cfg: StoreSpec = serde_json5::from_str(
+            r#"{ compression: { compression_algorithm: { zstd: {
+                 temp_path: "/var/tmp/nl-zstd", max_compressed_upload_size: "512MiB",
+                 compression_level: 19, max_recompression_size: "64MiB" } },
+                 backend: { memory: {} } } }"#,
+        )
+        .unwrap();
+        let StoreSpec::Compression(spec) = cfg else {
+            panic!("wrong variant")
+        };
+        let CompressionAlgorithm::Zstd(spec) = spec.compression_algorithm else {
+            panic!("wrong compression algorithm")
+        };
+        assert_eq!(spec.max_compressed_upload_size, 512 * 1024 * 1024);
+        assert_eq!(spec.compression_level, Some(19));
+        assert_eq!(spec.max_recompression_size, 64 * 1024 * 1024);
+        assert_eq!(spec.max_concurrent_staged_uploads, 0); // 0 = "use default 4" at construction
+        assert_eq!(spec.max_concurrent_recompressions, 0); // 0 = "use default 1"
+        assert_eq!(spec.max_concurrent_identity_ops, 0); // 0 = "use default 256"
+        assert_eq!(spec.stage_timeout_s, 0); // 0 = "use default 600"
+        assert_eq!(spec.max_inline_commit_size, 0); // 0 = "use default 4MiB"
+    }
+
+    #[test]
+    fn zstd_compression_level_may_be_omitted() {
+        // `compression_level` has no `#[serde(default)]`; confirm the documented
+        // "omitted means the default level" spelling actually deserializes.
+        let cfg: StoreSpec = serde_json5::from_str(
+            r#"{ compression: { compression_algorithm: { zstd: {
+                 temp_path: "/var/tmp/nl-zstd", max_compressed_upload_size: "512MiB" } },
+                 backend: { memory: {} } } }"#,
+        )
+        .unwrap();
+        let StoreSpec::Compression(spec) = cfg else {
+            panic!("wrong variant")
+        };
+        let CompressionAlgorithm::Zstd(spec) = spec.compression_algorithm else {
+            panic!("wrong compression algorithm")
+        };
+        assert_eq!(spec.compression_level, None);
+        assert_eq!(spec.max_recompression_size, 0);
     }
 }

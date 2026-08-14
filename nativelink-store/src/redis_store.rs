@@ -35,14 +35,16 @@ use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_redis_tester::SubscriptionManagerNotify;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
-use nativelink_util::spawn;
+use nativelink_util::metrics::{record_connection_acquired, record_connection_reconnect};
 use nativelink_util::store_trait::{
-    BoolValue, RemoveItemCallback, SchedulerCurrentVersionProvider, SchedulerIndexProvider,
+    BoolValue, RemoveCallback, SchedulerCurrentVersionProvider, SchedulerIndexProvider,
     SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo, SchedulerStoreKeyProvider,
     SchedulerSubscription, SchedulerSubscriptionManager, StoreDriver, StoreKey, UploadSizeInfo,
 };
 use nativelink_util::task::JoinHandleDropGuard;
+use nativelink_util::{background_spawn, spawn};
 use parking_lot::{Mutex, RwLock};
 use patricia_tree::StringPatriciaMap;
 use redis::aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig};
@@ -53,9 +55,11 @@ use redis::{
     AsyncCommands, AsyncIter, Client, IntoConnectionInfo, PushInfo, ScanOptions, Script, Value,
     pipe,
 };
+use serde::Deserialize;
+use serde::de::IntoDeserializer;
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, trace, warn};
@@ -121,6 +125,16 @@ const DEFAULT_SCAN_COUNT: usize = 10_000;
 pub const DEFAULT_MAX_COUNT_PER_CURSOR: u64 = 1_500;
 
 const DEFAULT_CLIENT_PERMITS: usize = 500;
+
+/// Converts a TTL to the seconds `EXPIRE` takes.
+///
+/// Clamped to at least one second. Redis treats `EXPIRE` with a value of zero
+/// or less as "delete now", so a sub-second duration reaching here would
+/// destroy the value it was meant to protect. Config already rejects zero, so
+/// this only guards a future caller.
+fn ttl_seconds(key_ttl: Duration) -> i64 {
+    i64::try_from(key_ttl.as_secs()).unwrap_or(i64::MAX).max(1)
+}
 
 /// A wrapper around Redis to allow it to be reconnected.
 pub trait RedisManager<C>
@@ -301,6 +315,7 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
                 return Ok(guard.clone());
             }
         }
+        record_connection_reconnect("redis");
         let mut connection_manager = (self.connect_func)().await?;
         let new_uuid = Uuid::new_v4();
         self.configure(&mut connection_manager).await?;
@@ -325,6 +340,7 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
     }
 
     async fn psubscribe(&self, pattern: &str) -> Result<(), Error> {
+        debug!(pattern, "new psubscribe");
         let mut connection = self.get_connection().await?.0;
         let new_subscription = self.subscriptions.lock().insert(String::from(pattern));
         if new_subscription {
@@ -334,6 +350,7 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
             }
             result?;
         }
+        debug!(pattern, new_subscription, "new psubscribe complete");
         Ok(())
     }
 }
@@ -386,10 +403,7 @@ where
     max_count_per_cursor: u64,
 
     /// A manager for subscriptions to keys in Redis.
-    subscription_manager: tokio::sync::OnceCell<Arc<RedisSubscriptionManager>>,
-
-    /// Channel for getting subscription messages
-    subscriber_channel: Mutex<Option<UnboundedReceiver<PushInfo>>>,
+    subscription_manager: Arc<RedisSubscriptionManager>,
 
     /// Permits to limit inflight Redis requests. Technically only
     /// limits the calls to `get_client()`, but the requests per client
@@ -398,6 +412,16 @@ where
 
     /// Per-call ceiling for `check_health` PING.
     health_check_timeout: Duration,
+
+    /// Expire keys this store writes after this long. `None` keeps them
+    /// forever, which is the default and what every store other than a BEP
+    /// store wants.
+    key_ttl: Option<Duration>,
+
+    /// Have we done a subscribe for messages for `remove_callback` subscribes?
+    has_remove_callback_subscribe: OnceCell<()>,
+
+    remove_callbacks: Arc<async_lock::Mutex<Vec<RemoveCallback>>>,
 }
 
 impl<C, M> Debug for RedisStore<C, M>
@@ -416,7 +440,6 @@ where
             )
             .field("scan_count", &self.scan_count)
             .field("subscription_manager", &self.subscription_manager)
-            .field("subscriber_channel", &self.subscriber_channel)
             .field("client_permits", &self.client_permits)
             .finish()
     }
@@ -447,6 +470,35 @@ impl<C: ConnectionLike> Drop for ClientWithPermit<C> {
     }
 }
 
+/// Decode a `StoreKey` coming from Redis
+pub fn decode_key<'a>(
+    key_prefix: &String,
+    encoded_key: Cow<'a, str>,
+) -> Result<StoreKey<'a>, Error> {
+    let key_no_prefix = if key_prefix.is_empty() {
+        encoded_key
+    } else {
+        match encoded_key.strip_prefix(key_prefix) {
+            Some(r) => Cow::from(r.to_string()),
+            None => {
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "Redis key ({}) is missing prefix ({})",
+                    encoded_key,
+                    key_prefix
+                ));
+            }
+        }
+    };
+    let maybe_digest_info: Result<_, serde::de::value::Error> =
+        DigestInfo::deserialize(key_no_prefix.clone().into_deserializer());
+    if let Ok(digest_info) = maybe_digest_info {
+        Ok(StoreKey::Digest(digest_info))
+    } else {
+        Ok(StoreKey::Str(key_no_prefix))
+    }
+}
+
 impl<C, M> RedisStore<C, M>
 where
     C: ConnectionLike + Clone + Sync,
@@ -464,10 +516,20 @@ where
         max_client_permits: usize,
         max_count_per_cursor: u64,
         health_check_timeout: Duration,
+        key_ttl: Option<Duration>,
         subscriber_channel: UnboundedReceiver<PushInfo>,
         connection_manager: M,
     ) -> Result<Self, Error> {
         info!("Redis index fingerprint: {FINGERPRINT_CREATE_INDEX_HEX}");
+        let remove_callbacks = Arc::new(async_lock::Mutex::new(Vec::new()));
+        let subscription_manager = Arc::new(RedisSubscriptionManager::new(
+            subscriber_channel,
+            remove_callbacks.clone(),
+            key_prefix.clone(),
+        ));
+        if let Some(channel) = &pub_sub_channel {
+            connection_manager.psubscribe(channel).await?;
+        }
 
         Ok(Self {
             connection_manager,
@@ -478,17 +540,22 @@ where
             read_chunk_size,
             max_chunk_uploads_per_update,
             scan_count,
-            subscription_manager: tokio::sync::OnceCell::new(),
-            subscriber_channel: Mutex::new(Some(subscriber_channel)),
+            subscription_manager,
             client_permits: Arc::new(Semaphore::new(max_client_permits)),
             max_count_per_cursor,
             health_check_timeout,
+            key_ttl,
+            has_remove_callback_subscribe: OnceCell::const_new(),
+            remove_callbacks,
         })
     }
 
     async fn get_client(&self) -> Result<ClientWithPermit<C>, Error> {
         let local_client_permits = self.client_permits.clone();
         let remaining = local_client_permits.available_permits();
+        // Zero here means every client is busy and this call is about to wait,
+        // which is the saturation signal worth alerting on.
+        record_connection_acquired("redis", Some(remaining), remaining == 0);
         let semaphore_permit = local_client_permits.acquire_owned().await?;
         trace!(remaining, "Got a client permit");
         let (connection_manager, uuid) = self.connection_manager.get_connection().await?;
@@ -499,8 +566,8 @@ where
         })
     }
 
-    /// Encode a [`StoreKey`] so it can be sent to Redis.
-    fn encode_key<'a>(&self, key: &'a StoreKey<'a>) -> Cow<'a, str> {
+    /// Encode a `StoreKey` so it can be sent to Redis.
+    pub fn encode_key<'a>(&self, key: &'a StoreKey<'a>) -> Cow<'a, str> {
         let key_body = key.as_str();
         if self.key_prefix.is_empty() {
             key_body
@@ -639,6 +706,7 @@ impl RedisStore<ClusterConnection, ClusterRedisManager<ClusterConnection>> {
             spec.max_client_permits,
             spec.max_count_per_cursor,
             Duration::from_millis(spec.health_check_timeout_ms),
+            (spec.key_ttl_s > 0).then(|| Duration::from_secs(spec.key_ttl_s)),
             subscriber_channel,
             ClusterRedisManager::new(client.get_async_connection().await?).await?,
         )
@@ -712,12 +780,12 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
                     .await?
                     .map_err(Into::<Error>::into),
                 }
-                .err_tip_with_code(|_e| {
-                    (
-                        Code::InvalidArgument,
-                        format!("While connecting to redis with url: {local_addr}"),
-                    )
-                })
+                // Keep the underlying error's code rather than forcing
+                // InvalidArgument. Not every connect failure is a bad URL: a
+                // sentinel failover in progress reports the master as missing,
+                // which is transient and retryable, and overriding it to a
+                // permanent status made clients give up on a recoverable blip.
+                .err_tip(|| format!("While connecting to redis with url: {local_addr}"))
             }),
         )
         .await
@@ -766,6 +834,7 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
             spec.max_client_permits,
             spec.max_count_per_cursor,
             Duration::from_millis(spec.health_check_timeout_ms),
+            (spec.key_ttl_s > 0).then(|| Duration::from_secs(spec.key_ttl_s)),
             subscriber_channel,
             StandardRedisManager::new(Box::new(move || {
                 Box::pin(Self::connect(spec.clone(), tx.clone()))
@@ -913,19 +982,21 @@ where
                             errors.push(format!("Non-utf8 key {raw_key:?}"));
                             continue;
                         };
-                        if let Some(key) = str_key.strip_prefix(&self.key_prefix) {
-                            let key = StoreKey::new_str(key);
-                            if range.contains(&key) {
-                                iterations += 1;
-                                if !handler(&key) {
-                                    error!("Issue in handler");
-                                    errors.push("Issue in handler".to_string());
+                        match decode_key(&self.key_prefix, Cow::from(str_key)) {
+                            Ok(key) => {
+                                if range.contains(&key) {
+                                    iterations += 1;
+                                    if !handler(&key) {
+                                        error!("Issue in handler");
+                                        errors.push("Issue in handler".to_string());
+                                    }
+                                } else {
+                                    trace!(%key, ?range, "Key not in range");
                                 }
-                            } else {
-                                trace!(%key, ?range, "Key not in range");
                             }
-                        } else {
-                            errors.push("Key doesn't match prefix".to_string());
+                            Err(e) => {
+                                errors.push(e.to_string());
+                            }
                         }
                     }
                     Err(err)
@@ -1041,6 +1112,29 @@ where
                             return Err(error);
                         }
                     }
+                    // Guard the temp key as soon as it exists. An update that
+                    // dies anywhere after this — mid-upload, during the length
+                    // check, during the rename — would otherwise leave the
+                    // temp key behind forever, and nothing cleans those up.
+                    // EXPIRE on a key that does not exist yet is a no-op, so
+                    // this has to happen after the first chunk lands rather
+                    // than before the loop.
+                    if offset == 0 && let Some(key_ttl) = self.key_ttl {
+                        let ttl_secs = ttl_seconds(key_ttl);
+                        match connection_manager.expire::<_, ()>(temp_key_ref, ttl_secs).await {
+                            Ok(()) => {}
+                            Err(err) if is_retryable_redis_error(&err) => {
+                                let (mut connection_manager, _connect_id) = self.connection_manager.reconnect(connect_id).await?;
+                                connection_manager
+                                    .expire::<_, ()>(temp_key_ref, ttl_secs)
+                                    .await
+                                    .err_tip(|| format!("(after reconnect) while setting TTL on temp key ({temp_key_ref}) in RedisStore::update"))?;
+                            }
+                            Err(err) => {
+                                return Err(Error::from(err).append(format!("While setting TTL on temp key ({temp_key_ref}) in RedisStore::update")));
+                            }
+                        }
+                    }
                     Ok::<u32, Error>(end_pos)
                 })
             })
@@ -1129,6 +1223,43 @@ where
             }
         }
 
+        // The rename carries the temp key's TTL across, so the key is never
+        // unprotected. Re-setting it here restarts the window at completion
+        // rather than at the first byte, which matters for a large blob whose
+        // upload takes a noticeable slice of the TTL. Reconnect once on a
+        // transient failover error, the same as the rename above: a key that
+        // silently never expires is the bug this option exists to prevent.
+        if let Some(key_ttl) = self.key_ttl {
+            let ttl_secs = ttl_seconds(key_ttl);
+            match client
+                .connection_manager
+                .expire::<_, ()>(final_key.as_ref(), ttl_secs)
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if is_retryable_redis_error(&err) => {
+                    let (connection_manager, uuid) =
+                        self.connection_manager.reconnect(client.uuid).await?;
+                    client.connection_manager = connection_manager;
+                    client.uuid = uuid;
+                    client
+                        .connection_manager
+                        .expire::<_, ()>(final_key.as_ref(), ttl_secs)
+                        .await
+                        .err_tip(|| {
+                            format!(
+                                "While setting TTL on {final_key} (after reconnect) in RedisStore::update()"
+                            )
+                        })?;
+                }
+                Err(err) => {
+                    return Err(Error::from(err).append(format!(
+                        "While setting TTL on {final_key} in RedisStore::update()"
+                    )));
+                }
+            }
+        }
+
         // If we have a publish channel configured, send a notice that the key has been set.
         if let Some(pub_sub_channel) = &self.pub_sub_channel {
             client
@@ -1169,13 +1300,13 @@ where
         // We want to read the data at the key from `offset` to `offset + length`.
         let data_start = offset;
         let data_end = data_start
-            .saturating_add(length.unwrap_or(isize::MAX as usize) as isize)
+            .saturating_add(length.map_or(isize::MAX, |l| isize::try_from(l).unwrap_or(isize::MAX)))
             .saturating_sub(1);
 
         // And we don't ever want to read more than `read_chunk_size` bytes at a time, so we'll need to iterate.
         let mut chunk_start = data_start;
         let mut chunk_end = cmp::min(
-            data_start.saturating_add(self.read_chunk_size as isize) - 1,
+            data_start.saturating_add(self.read_chunk_size.try_into().unwrap_or(isize::MAX)) - 1,
             data_end,
         );
 
@@ -1233,7 +1364,8 @@ where
             // ...and go grab the next chunk.
             chunk_start = chunk_end + 1;
             chunk_end = cmp::min(
-                chunk_start.saturating_add(self.read_chunk_size as isize) - 1,
+                chunk_start.saturating_add(self.read_chunk_size.try_into().unwrap_or(isize::MAX))
+                    - 1,
                 data_end,
             );
         }
@@ -1293,11 +1425,38 @@ where
         registry.register_indicator(self);
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
-        // As redis doesn't drop stuff, we can just ignore this
+    fn register_remove_callback(self: Arc<Self>, callback: RemoveCallback) -> Result<(), Error> {
+        debug!(?callback, "New callback");
+        let local_self = self.clone();
+        background_spawn!("remove_callback_subscribe", async move {
+            self.remove_callbacks.lock().await.push(callback);
+            if let Err(err) = local_self.clone().has_remove_callback_subscribe
+                .get_or_try_init(|| async move {
+                    let mut client = local_self.get_client().await?;
+                    let cfg = redis::cmd("CONFIG").arg("GET").arg("notify-keyspace-events").to_owned().query_async::<Vec<(String,String)>>(&mut client.connection_manager).await.map_err(|e| Error::from(e).append("Parsing notify-keyspace-events"))?;
+                    if cfg.len() != 1 {
+                        warn!(?cfg, "Got multiple items for CONFIG GET, expected one");
+                        return Err(make_input_err!("Got multiple items for CONFIG GET, expected one"));
+                    }
+                    let events_cfg = &cfg.first().ok_or_else(|| make_err!(Code::InvalidArgument, "Only one item"))?.1;
+                    if events_cfg.is_empty() {
+                        error!("notify-keyspace-events not enabled for Redis, will fail to get remove callbacks");
+                    } else if !events_cfg.contains('K') {
+                        error!(notify_keyspace_events=events_cfg, "notify-keyspace-events does not contain 'K' so won't get keyspace events we need for eviction events");
+                    } else if !events_cfg.contains('A') {
+                        error!(notify_keyspace_events=events_cfg, "notify-keyspace-events does not contain 'A' so we won't get eviction events");
+                    }
+                    // FIXME: Redis events spec appears unreliable, so we subscribe anyways
+                    // It should just need Ke as per https://redis.io/docs/latest/develop/pubsub/keyspace-notifications/
+                    // but I'm yet to get reliable eviction events out of that
+                    info!(notify_keyspace_events=events_cfg, "Attempting to subscribe to eviction events");
+                    self.connection_manager.psubscribe("__key*__:*").await?;
+                    Ok::<(), Error>(())
+                 })
+                .await {
+                    error!(?err, "Error while trying to initialise remove_callback_subscribe");
+                }
+        });
         Ok(())
     }
 }
@@ -1645,7 +1804,11 @@ pub struct RedisSubscriptionManager {
 }
 
 impl RedisSubscriptionManager {
-    pub fn new(subscriber_channel: UnboundedReceiver<PushInfo>) -> Self {
+    pub fn new(
+        subscriber_channel: UnboundedReceiver<PushInfo>,
+        remove_callbacks: Arc<async_lock::Mutex<Vec<RemoveCallback>>>,
+        key_prefix: String,
+    ) -> Self {
         let subscribed_keys = Arc::new(RwLock::new(StringPatriciaMap::new()));
         let subscribed_keys_weak = Arc::downgrade(&subscribed_keys);
         let (tx_for_test, mut rx_for_test) = unbounded_channel();
@@ -1656,6 +1819,7 @@ impl RedisSubscriptionManager {
             _subscription_spawn: Arc::new(Mutex::new(spawn!(
                 "redis_subscribe_spawn",
                 async move {
+                    debug!("running subscribe loop");
                     loop {
                         loop {
                             let key = select! {
@@ -1682,7 +1846,7 @@ impl RedisSubscriptionManager {
                                             error!(?push_info, "Expected exactly 3 values on subscriber channel (pattern, channel, value)");
                                             continue;
                                         }
-                                        match push_info.data.last().unwrap() {
+                                        let value = match push_info.data.last().unwrap() {
                                             Value::SimpleString(s) => {
                                                 s.clone()
                                             }
@@ -1693,7 +1857,49 @@ impl RedisSubscriptionManager {
                                                 error!(?other, "Received non-string message in RedisSubscriptionManager");
                                                 continue;
                                             }
+                                        };
+                                        // Redis reports maxmemory eviction as
+                                        // "evicted" and TTL expiry as "expired".
+                                        // Both mean the key is gone, so both have
+                                        // to invalidate anything caching its
+                                        // existence; treating only one as a removal
+                                        // leaves an ExistenceCacheStore claiming to
+                                        // hold a key that Redis has already dropped.
+                                        if value == "evicted" || value == "expired" {
+                                            trace!(?push_info, %value, "Key removal event");
+                                            let removed_key = if let Some(key) = push_info.data.get(1) {
+                                                if let Value::BulkString(s) = key {
+                                                    String::from_utf8(s.clone()).expect("String message")
+                                                } else {
+                                                    error!(?push_info, "Removed key wasn't bulk-string");
+                                                    continue;
+                                                }
+                                            } else {
+                                                error!(?push_info, "No key in removal event");
+                                                continue;
+                                            };
+                                            trace!(?removed_key, "Removed key");
+                                            let Some((_prefix, internal_key)) = removed_key.split_once(':') else {
+                                                error!(?removed_key, "Removed key doesn't contain a colon");
+                                                continue;
+                                            };
+
+                                            let store_key = match decode_key(&key_prefix, Cow::from(internal_key)) {
+                                                Ok(k) => k.into_owned(),
+                                                Err(err) => {
+                                                    error!(%err, internal_key, "Bad redis key");
+                                                    continue;
+                                                }
+                                            };
+                                            let locked_remove_callbacks = remove_callbacks.lock().await;
+                                            let mut callbacks: FuturesUnordered<_> =
+                                                locked_remove_callbacks.iter()
+                                                .map(|callback| callback.callback(store_key.borrow()))
+                                                .collect();
+                                            while callbacks.next().await.is_some() {}
+                                            continue
                                         }
+                                        value
                                     } else {
                                         error!("Error receiving message in RedisSubscriptionManager from subscriber_channel");
                                         break;
@@ -1786,23 +1992,12 @@ where
     type SubscriptionManager = RedisSubscriptionManager;
 
     async fn subscription_manager(&self) -> Result<Arc<RedisSubscriptionManager>, Error> {
-        self.subscription_manager
-            .get_or_try_init(|| async move {
-                let Some(subscriber_channel) = self.subscriber_channel.lock().take() else {
-                    return Err(make_input_err!(
-                        "Multiple attempts to obtain the subscription manager in RedisStore"
-                    ));
-                };
-                let Some(pub_sub_channel) = &self.pub_sub_channel else {
-                    return Err(make_input_err!(
-                        "RedisStore must have a pubsub for Redis Scheduler if using subscriptions"
-                    ));
-                };
-                self.connection_manager.psubscribe(pub_sub_channel).await?;
-                Ok(Arc::new(RedisSubscriptionManager::new(subscriber_channel)))
-            })
-            .await
-            .map(Clone::clone)
+        if self.pub_sub_channel.is_none() {
+            return Err(make_input_err!(
+                "RedisStore must have a pubsub for Redis Scheduler if using subscriptions"
+            ));
+        }
+        Ok(self.subscription_manager.clone())
     }
 
     async fn update_data<T>(&self, data: T, expiry: Option<Duration>) -> Result<Option<i64>, Error>

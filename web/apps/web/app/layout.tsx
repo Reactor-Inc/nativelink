@@ -1,4 +1,5 @@
 import { FinalCTA, SiteFooter, SiteHeader, ThemeProvider, themeInitScript } from "@nativelink/ui";
+import { GoogleTagManager } from "@next/third-parties/google";
 import { GeistMono } from "geist/font/mono";
 import { GeistSans } from "geist/font/sans";
 import type { Metadata } from "next";
@@ -27,6 +28,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         {/* biome-ignore lint/security/noDangerouslySetInnerHtml: Inline before hydration so the theme is correct on first paint. */}
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>
+      <GoogleTagManager gtmId="GTM-NNLLRWGB" />
       <body className="flex min-h-screen flex-col bg-background text-foreground antialiased">
         <ThemeProvider>
           <SiteHeader />
@@ -35,7 +37,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           </main>
           <FinalCTA
             title="Let's build at the speed your code is being written."
-            body="Open source. Free cloud tier. Self-host the moment your team is ready."
+            body="Open source. Self-host the moment your team is ready."
             primaryLabel="Get started"
             primaryHref="/docs"
             primaryNewTab

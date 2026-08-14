@@ -16,35 +16,29 @@
 //!
 //! This module handles compression/decompression of blob data on the gRPC wire
 //! between client and server, per the REAPI compressed-blobs specification.
-//! This is orthogonal to at-rest compression (`CompressionStore` with LZ4).
+//!
+//! Wire compression is independent of at-rest compression, but not always
+//! disjoint from it: a store whose physical representation already matches the
+//! negotiated wire representation can serve and accept those bytes directly.
+//! Such a store advertises itself through
+//! [`WireCompressionStore`](nativelink_util::store_trait::WireCompressionStore),
+//! and the `ByteStream`/CAS services use that capability to skip the codecs
+//! here. See [`wire_compressor_capability`].
 
 use std::collections::HashSet;
-use std::io::Read;
 
 use bytes::Bytes;
 use nativelink_config::cas_server::{CapabilitiesConfig, InstanceName, WithInstanceName};
-use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
+use nativelink_error::{Code, Error, make_err, make_input_err};
 use nativelink_proto::build::bazel::remote::execution::v2::compressor;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
-use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::spawn_blocking;
+// The codecs are shared with client-side GrpcStore transfers; re-export so
+// existing service callers keep their import paths.
+pub use nativelink_util::wire_compression::{
+    ZSTD_COMPRESSION_LEVEL, compress, decompress, stream_decode_compressed_upload,
+    stream_encode_compressed_download, wire_compressor_capability,
+};
 use tracing::warn;
-
-/// Zstd compression level for wire compression.
-/// Level 0 in the zstd crate means "use default" (currently 3).
-/// We use an explicit level for clarity.
-pub const ZSTD_COMPRESSION_LEVEL: i32 = 3;
-
-/// Upper bound on the buffer `decompress` reserves up front for a zstd blob.
-/// `expected_size` comes from the client's claimed digest, so it must never be
-/// used as an allocation hint directly: a small payload claiming a huge size
-/// would otherwise force a large pre-emptive allocation before the real
-/// decompressed length is ever known. We reserve `min(expected_size, this)`
-/// so common payloads never reallocate while a hostile claim allocates at most
-/// this. Sized comfortably above any honest `BatchUpdateBlobs` payload (the
-/// only caller of this bulk path; large blobs stream through `ByteStream`).
-const ZSTD_DECOMPRESS_PREALLOC_CAP: usize = 1024 * 1024;
 
 /// Which instances accept and advertise REAPI compressed-blobs (zstd).
 ///
@@ -78,55 +72,6 @@ impl RemoteCacheCompressionInstances {
     }
 }
 
-#[derive(Debug)]
-pub struct BufChannelReader {
-    rx: DropCloserReadHalf,
-    chunk: Bytes,
-    chunk_offset: usize,
-}
-
-impl BufChannelReader {
-    pub const fn new(rx: DropCloserReadHalf) -> Self {
-        Self {
-            rx,
-            chunk: Bytes::new(),
-            chunk_offset: 0,
-        }
-    }
-
-    fn refill_chunk(&mut self) -> std::io::Result<bool> {
-        while self.chunk_offset == self.chunk.len() {
-            self.chunk = self.rx.blocking_recv().map_err(Error::to_std_err)?;
-            self.chunk_offset = 0;
-            if self.chunk.is_empty() {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-}
-
-impl Read for BufChannelReader {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-
-        if !self.refill_chunk()? {
-            return Ok(0);
-        }
-
-        let chunk_remaining = &self.chunk[self.chunk_offset..];
-        let bytes_to_copy = output.len().min(chunk_remaining.len());
-
-        output[..bytes_to_copy].copy_from_slice(&chunk_remaining[..bytes_to_copy]);
-        self.chunk_offset += bytes_to_copy;
-
-        Ok(bytes_to_copy)
-    }
-}
-
 /// Resolve a wire compressor from a URI compressor string (as it appears in
 /// the `compressed-blobs/{compressor}/...` resource name) and validate it
 /// against whether the instance supports remote cache compression.
@@ -150,88 +95,6 @@ pub fn resolve_wire_compressor(
             }
         }
         Some(other) => Err(make_input_err!("Unsupported wire compressor: '{}'", other)),
-    }
-}
-
-/// Compress data using the specified wire compressor.
-///
-/// `data` is the raw (uncompressed) bytes from the store.
-/// Returns the compressed bytes suitable for sending on the wire.
-pub fn compress(data: Bytes, compressor_value: compressor::Value) -> Result<Bytes, Error> {
-    match compressor_value {
-        compressor::Value::Identity => Ok(data),
-        compressor::Value::Zstd => {
-            let compressed = zstd::bulk::compress(&data, ZSTD_COMPRESSION_LEVEL)
-                .map_err(|e| make_err!(Code::Internal, "Zstd compression failed: {}", e))?;
-            Ok(Bytes::from(compressed))
-        }
-        _ => Err(make_input_err!(
-            "Unsupported wire compressor for compression: {:?}",
-            compressor_value
-        )),
-    }
-}
-
-/// Decompress data using the specified wire compressor.
-///
-/// `data` is the compressed bytes received from the wire.
-/// `expected_size` is the uncompressed size (from the client's digest). It is
-/// the hard cap on the decompressed output, but never a direct allocation
-/// hint: the buffer grows with the real decoded bytes so a small payload
-/// claiming a huge size cannot force a large up-front allocation.
-/// Returns the decompressed bytes suitable for storing.
-pub fn decompress(
-    data: &[u8],
-    compressor_value: compressor::Value,
-    expected_size: usize,
-) -> Result<Bytes, Error> {
-    match compressor_value {
-        compressor::Value::Identity => {
-            if data.len() != expected_size {
-                return Err(make_err!(
-                    Code::InvalidArgument,
-                    "Identity data size {} does not match expected size {}",
-                    data.len(),
-                    expected_size
-                ));
-            }
-            Ok(Bytes::copy_from_slice(data))
-        }
-        compressor::Value::Zstd => {
-            // Decode incrementally so `expected_size` (which is attacker
-            // controlled — it is the client's claimed digest size) can bound
-            // the output without being trusted as an allocation size. We
-            // reserve only `min(expected_size, ZSTD_DECOMPRESS_PREALLOC_CAP)`,
-            // then `take(expected_size + 1)` hard-caps the decoder so a
-            // decompression bomb is rejected as soon as it overshoots. This
-            // mirrors the real-byte-count validation the identity arm and the
-            // streaming upload path already perform.
-            let decoder = zstd::stream::read::Decoder::new(data)
-                .map_err(|e| make_err!(Code::InvalidArgument, "Zstd decompression failed: {e}"))?;
-            let mut output = Vec::with_capacity(expected_size.min(ZSTD_DECOMPRESS_PREALLOC_CAP));
-            // `+ 1` lets an oversized stream produce one byte past the cap so
-            // the size check below rejects it rather than silently truncating.
-            let cap = u64::try_from(expected_size)
-                .err_tip(|| "expected_size did not fit in u64")?
-                .saturating_add(1);
-            decoder
-                .take(cap)
-                .read_to_end(&mut output)
-                .map_err(|e| make_err!(Code::InvalidArgument, "Zstd decompression failed: {e}"))?;
-            if output.len() != expected_size {
-                return Err(make_err!(
-                    Code::InvalidArgument,
-                    "Decompressed size {} does not match expected size {}",
-                    output.len(),
-                    expected_size
-                ));
-            }
-            Ok(Bytes::from(output))
-        }
-        _ => Err(make_input_err!(
-            "Unsupported wire compressor for decompression: {:?}",
-            compressor_value
-        )),
     }
 }
 
@@ -289,107 +152,4 @@ pub async fn decompress_batch_update(
         }
         other => Err(make_input_err!("Unsupported wire compressor: {:?}", other)),
     }
-}
-
-pub fn stream_decode_compressed_upload(
-    compressed_rx: DropCloserReadHalf,
-    wire_compressor: compressor::Value,
-    digest: DigestInfo,
-    digest_function: DigestHasherFunc,
-    mut tx: DropCloserWriteHalf,
-) -> Result<(), Error> {
-    if wire_compressor != compressor::Value::Zstd {
-        return Err(make_input_err!(
-            "Streaming upload decompression only supports zstd, got {:?}",
-            wire_compressor
-        ));
-    }
-
-    let expected_size = digest.size_bytes();
-    let mut hasher = digest_function.hasher();
-    let mut decoded_size = 0u64;
-    let mut buffer = vec![0u8; zstd::zstd_safe::DCtx::out_size()];
-
-    let reader = BufChannelReader::new(compressed_rx);
-    let mut decoder = zstd::stream::read::Decoder::new(reader)
-        .map_err(|e| make_err!(Code::InvalidArgument, "Zstd decompression failed: {}", e))?;
-    loop {
-        let read = decoder
-            .read(&mut buffer)
-            .map_err(|e| make_err!(Code::InvalidArgument, "Zstd decompression failed: {}", e))?;
-        if read == 0 {
-            break;
-        }
-        let read_u64 =
-            u64::try_from(read).err_tip(|| "Decoded chunk size was not convertible to u64")?;
-        decoded_size = decoded_size.checked_add(read_u64).ok_or_else(|| {
-            make_err!(
-                Code::InvalidArgument,
-                "Decoded compressed upload size overflow"
-            )
-        })?;
-        if decoded_size > expected_size {
-            return Err(make_err!(
-                Code::InvalidArgument,
-                "Decoded compressed upload size {} bytes exceeds digest size {} bytes",
-                decoded_size,
-                expected_size
-            ));
-        }
-        hasher.update(&buffer[..read]);
-        tx.blocking_send(Bytes::copy_from_slice(&buffer[..read]))?;
-    }
-
-    if decoded_size != expected_size {
-        return Err(make_err!(
-            Code::InvalidArgument,
-            "Decompressed size {} does not match expected size {}",
-            decoded_size,
-            expected_size
-        ));
-    }
-    let actual_digest = hasher.finalize_digest();
-    if actual_digest != digest {
-        return Err(make_err!(
-            Code::InvalidArgument,
-            "Decompressed digest {} does not match expected digest {}",
-            actual_digest,
-            digest
-        ));
-    }
-
-    tx.send_eof()
-        .err_tip(|| "Failed to send decompressed upload EOF")?;
-    Ok(())
-}
-
-pub fn stream_encode_compressed_download(
-    raw_rx: DropCloserReadHalf,
-    wire_compressor: compressor::Value,
-    mut tx: DropCloserWriteHalf,
-) -> Result<(), Error> {
-    if wire_compressor != compressor::Value::Zstd {
-        return Err(make_input_err!(
-            "Streaming download compression only supports zstd, got {:?}",
-            wire_compressor
-        ));
-    }
-
-    let reader = BufChannelReader::new(raw_rx);
-    let mut encoder = zstd::stream::read::Encoder::new(reader, ZSTD_COMPRESSION_LEVEL)
-        .map_err(|e| make_err!(Code::Internal, "Zstd compression failed: {}", e))?;
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = encoder
-            .read(&mut buffer)
-            .map_err(|e| make_err!(Code::Internal, "Zstd compression failed: {}", e))?;
-        if read == 0 {
-            break;
-        }
-        tx.blocking_send(Bytes::copy_from_slice(&buffer[..read]))?;
-    }
-
-    tx.send_eof()
-        .err_tip(|| "Failed to send compressed download EOF")?;
-    Ok(())
 }

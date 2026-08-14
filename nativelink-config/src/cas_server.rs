@@ -18,6 +18,7 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 #[cfg(feature = "dev-schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::schedulers::SchedulerSpec;
 use crate::serde_utils::{
@@ -26,7 +27,9 @@ use crate::serde_utils::{
     convert_optional_numeric_with_shellexpand, convert_optional_string_with_shellexpand,
     convert_string_with_shellexpand, convert_vec_string_with_shellexpand,
 };
-use crate::stores::{ClientTlsConfig, ConfigDigestHashFunction, StoreRefName, StoreSpec};
+use crate::stores::{
+    ClientTlsConfig, ConfigDigestHashFunction, StoreRefName, StoreSpec, StoreType,
+};
 
 /// Name of the scheduler. This type will be used when referencing a
 /// scheduler in the `CasConfig::schedulers`'s map key.
@@ -349,10 +352,25 @@ pub struct ByteStreamConfig {
         alias = "persist_stream_on_disconnect_timeout"
     )]
     pub persist_stream_on_disconnect_timeout_s: usize,
+
+    /// How long, in seconds, to wait for the *next* `WriteRequest` of a
+    /// compressed (`compressed-blobs/...`) upload before failing it with
+    /// `DEADLINE_EXCEEDED`. A client that keeps making progress resets the
+    /// deadline on every message, so this never rejects a large upload — it
+    /// bounds a client that opens a compressed write, takes a store slot, then
+    /// stalls or never sends `finish_write`.
+    ///
+    /// Default: 60 seconds
+    #[serde(
+        default,
+        deserialize_with = "convert_duration_with_shellexpand",
+        skip_serializing_if = "is_default"
+    )]
+    pub compressed_upload_idle_timeout_s: usize,
 }
 
 // Older bytestream config. All fields are as per the newer docs, but this requires
-// the hashed cas_stores v.s. the WithInstanceName approach. This should _not_ be updated
+// the hashed `cas_stores` v.s. the WithInstanceName approach. This should _not_ be updated
 // with newer fields, and eventually dropped
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -488,7 +506,7 @@ pub struct ServicesConfig {
 
     /// Capabilities service is required in order to use most of the
     /// bazel protocol. This service is used to provide the supported
-    /// features and versions of this bazel GRPC service.
+    /// features and versions of this bazel gRPC service.
     #[serde(
         default,
         deserialize_with = "super::backcompat::opt_vec_with_instance_name"
@@ -878,7 +896,7 @@ pub struct UploadActionResultConfig {
 pub struct LocalWorkerConfig {
     /// Name of the worker. This is give a more friendly name to a worker for logging
     /// and metric publishing. This is also the prefix of the worker id
-    /// (ie: "{name}{uuidv6}").
+    /// (i.e. "{name}{uuidv6}").
     /// Default: {Index position in the workers list}
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub name: String,
@@ -994,7 +1012,7 @@ pub struct LocalWorkerConfig {
     pub platform_properties: HashMap<String, WorkerProperty>,
 
     /// An optional mapping of environment names to set for the execution
-    /// as well as those specified in the action itself.  If set, will set each
+    /// as well as those specified in the action itself. If set, will set each
     /// key as an environment variable before executing the job with the value
     /// of the environment variable being the value of the property of the
     /// action being executed of that name or the fixed value.
@@ -1006,9 +1024,26 @@ pub struct LocalWorkerConfig {
     /// Default: None (directory cache disabled)
     pub directory_cache: Option<DirectoryCacheConfig>,
 
-    /// Whether to use namespaces to isolate the execution.  This is only available
-    /// on Linux.  It is highly recommended as it avoids a number of issues with
-    /// zombie processes and also provides additional hermeticity.  If explicitly set
+    /// Optional and experimental: lease every digest in an active action's
+    /// input Merkle closure in the worker's locally eviction-managed CAS
+    /// tiers (the `cas_fast_slow_store`'s filesystem-backed stores) until the
+    /// action has finished cleanup. This prevents `Lost inputs no longer
+    /// available remotely` failures caused by local fast-tier eviction while
+    /// inputs are being materialized under cache pressure.
+    ///
+    /// Trade-off: while leases are held, a local filesystem tier may
+    /// temporarily exceed its configured `max_bytes` / `max_count` eviction
+    /// limits; normal eviction resumes once the action's leases are released.
+    /// Operators should leave headroom on the underlying disk when enabling
+    /// this.
+    ///
+    /// Default: false (eviction behavior is unchanged)
+    #[serde(default)]
+    pub experimental_active_input_leases: bool,
+
+    /// Whether to use namespaces to isolate the execution. This is only available
+    /// on Linux. It is highly recommended as it avoids a number of issues with
+    /// zombie processes and also provides additional hermeticity. If explicitly set
     /// to true and it is not supported the worker will exit with an error.
     ///
     /// Note: this will fail for non-privileged Dockerised workers, as workers in
@@ -1018,9 +1053,9 @@ pub struct LocalWorkerConfig {
     /// Default: False.
     pub use_namespaces: Option<bool>,
 
-    /// Whether to use a mount namespace to isolate the worker root.  This is only
-    /// available on Linux and when `use_namespaces` is true.  It is highly recommended
-    /// provides additional hermeticity.  If explicitly set to true and it is not
+    /// Whether to use a mount namespace to isolate the worker root. This is only
+    /// available on Linux and when `use_namespaces` is true. It is highly recommended
+    /// provides additional hermeticity. If explicitly set to true and it is not
     /// supported or `use_namespaces` is not set to true the worker will exit with an
     /// error.
     /// Default: False.
@@ -1090,6 +1125,25 @@ pub struct DirectoryCacheConfig {
     /// Default: 64
     #[serde(default = "default_directory_cache_max_concurrent_fetches")]
     pub max_concurrent_fetches: usize,
+    /// On a directory-cache miss, prefetch every `Directory` proto of the
+    /// tree with one logical `GetTree` traversal instead of fetching protos
+    /// level by level (which costs one round trip per tree DEPTH). The
+    /// [REAPI request contract] permits servers to impose their own limit even
+    /// when no page size is specified, and the [REAPI response contract]
+    /// requires clients to continue with the returned page token. A paginated
+    /// traversal may therefore use multiple RPCs. Only takes effect when the
+    /// slow tier is a `grpc` store;
+    /// any prefetch failure falls back to the per-level path. Worthwhile when
+    /// worker-to-CAS latency is non-trivial and trees are deep; measured 5-34x
+    /// on the proto phase at 5-25ms RTT. Note the serving CAS pays the tree walk
+    /// against its own backend, so its directory protos should be served
+    /// from a fast tier.
+    ///
+    /// [REAPI request contract]: https://github.com/bazelbuild/remote-apis/blob/becdd8f9ff811df88a22d3eadd6341753d51d167/build/bazel/remote/execution/v2/remote_execution.proto#L1932-L1942
+    /// [REAPI response contract]: https://github.com/bazelbuild/remote-apis/blob/becdd8f9ff811df88a22d3eadd6341753d51d167/build/bazel/remote/execution/v2/remote_execution.proto#L1961-L1965
+    /// Default: false
+    #[serde(default)]
+    pub experimental_get_tree_prefetch: bool,
 }
 
 const fn default_directory_cache_max_entries() -> usize {
@@ -1177,19 +1231,91 @@ pub struct CasConfig {
 }
 
 impl CasConfig {
+    const ZSTD_COMPRESSION_DOCS_URL: &'static str =
+        "https://docs.nativelink.com/configuration/compression";
+
     /// # Errors
     ///
     /// Will return `Err` if we can't load the file.
     pub fn try_from_json5_file(config_file: &str) -> Result<Self, Error> {
         let json_contents = std::fs::read_to_string(config_file)
             .err_tip(|| format!("Could not open config file {config_file}"))?;
-        let config: Self = serde_json5::from_str(&json_contents)?;
+        Self::try_from_json5_str(&json_contents)
+    }
+
+    fn try_from_json5_str(json_contents: &str) -> Result<Self, Error> {
+        let mut config: Self = serde_json5::from_str(json_contents)?;
         for server in &config.servers {
             if let Some(services) = &server.services {
                 Self::check_store_conflict(services)?;
             }
         }
+        config.apply_zstd_grpc_store_defaults();
         Ok(config)
+    }
+
+    fn zstd_wire_compression_enabled_anywhere(&self) -> bool {
+        if self
+            .servers
+            .iter()
+            .filter_map(|server| server.services.as_ref())
+            .filter_map(|services| services.capabilities.as_deref())
+            .flatten()
+            .any(|capabilities| capabilities.remote_cache_compression)
+        {
+            return true;
+        }
+
+        self.stores.iter().any(|store| {
+            let mut enabled = false;
+            store.spec.visit_grpc_specs(&mut |grpc| {
+                enabled |= matches!(grpc.store_type, StoreType::Cas)
+                    && grpc.experimental_remote_cache_compression == Some(true);
+            });
+            enabled
+        })
+    }
+
+    fn apply_zstd_grpc_store_defaults(&mut self) {
+        let zstd_enabled_anywhere = self.zstd_wire_compression_enabled_anywhere();
+
+        for store in &mut self.stores {
+            let store_name = store.name.as_str();
+            store.spec.visit_grpc_specs_mut(&mut |grpc| {
+                if !matches!(grpc.store_type, StoreType::Cas) {
+                    if grpc.experimental_remote_cache_compression == Some(true) {
+                        warn!(
+                            store = store_name,
+                            instance_name = grpc.instance_name,
+                            "'experimental_remote_cache_compression' is enabled on a non-CAS \
+                             gRPC store, where it has no effect: REAPI zstd wire compression \
+                             only applies to CAS blob transfers. Enable it on the CAS gRPC \
+                             stores or a capabilities instance instead. See {}",
+                            Self::ZSTD_COMPRESSION_DOCS_URL,
+                        );
+                    }
+                    return;
+                }
+
+                if !zstd_enabled_anywhere {
+                    return;
+                }
+
+                match grpc.experimental_remote_cache_compression {
+                    None => grpc.experimental_remote_cache_compression = Some(true),
+                    Some(false) => warn!(
+                        store = store_name,
+                        instance_name = grpc.instance_name,
+                        "Zstd wire compression is enabled elsewhere, but this eligible CAS gRPC \
+                         store explicitly disables it. Unless this upstream cannot use zstd, \
+                         enable 'experimental_remote_cache_compression' for substantially faster \
+                         transfers of compressible artifacts. See {}",
+                        Self::ZSTD_COMPRESSION_DOCS_URL,
+                    ),
+                    Some(true) => {}
+                }
+            });
+        }
     }
 
     fn check_store_conflict(services: &ServicesConfig) -> Result<(), Error> {
@@ -1225,7 +1351,22 @@ impl CasConfig {
 
 #[cfg(test)]
 mod tests {
+    use tracing_test::traced_test;
+
     use super::*;
+
+    fn grpc_compression_configs(config: &CasConfig) -> Vec<(bool, Option<bool>)> {
+        let mut configs = Vec::new();
+        for store in &config.stores {
+            store.spec.visit_grpc_specs(&mut |grpc| {
+                configs.push((
+                    matches!(grpc.store_type, StoreType::Cas),
+                    grpc.experimental_remote_cache_compression,
+                ));
+            });
+        }
+        configs
+    }
 
     #[test]
     fn capabilities_config_remote_cache_compression_deserializes_true() {
@@ -1240,5 +1381,166 @@ mod tests {
         let config: CapabilitiesConfig = serde_json5::from_str("{}").unwrap();
 
         assert!(!config.remote_cache_compression);
+    }
+
+    #[test]
+    fn omitted_grpc_compression_stays_disabled_without_zstd_intent() {
+        let config = CasConfig::try_from_json5_str(
+            r#"{
+                stores: [{
+                    name: "upstream",
+                    grpc: {
+                        endpoints: [{ address: "http://localhost:1234" }],
+                        store_type: "cas",
+                    },
+                }],
+                servers: [],
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(grpc_compression_configs(&config), vec![(true, None)]);
+    }
+
+    #[test]
+    fn explicit_grpc_zstd_intent_enables_other_eligible_grpc_stores() {
+        let config = CasConfig::try_from_json5_str(
+            r#"{
+                stores: [
+                    {
+                        name: "enabled",
+                        grpc: {
+                            endpoints: [{ address: "http://localhost:1234" }],
+                            store_type: "cas",
+                            experimental_remote_cache_compression: true,
+                        },
+                    },
+                    {
+                        name: "inherited",
+                        grpc: {
+                            endpoints: [{ address: "http://localhost:5678" }],
+                            store_type: "cas",
+                        },
+                    },
+                ],
+                servers: [],
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            grpc_compression_configs(&config),
+            vec![(true, Some(true)), (true, Some(true))]
+        );
+    }
+
+    #[test]
+    #[traced_test]
+    fn ac_grpc_compression_warns_and_expresses_no_cas_intent() {
+        let config = CasConfig::try_from_json5_str(
+            r#"{
+                stores: [
+                    {
+                        name: "action-cache",
+                        grpc: {
+                            instance_name: "ac",
+                            endpoints: [{ address: "http://localhost:1234" }],
+                            store_type: "ac",
+                            experimental_remote_cache_compression: true,
+                        },
+                    },
+                    {
+                        name: "cas",
+                        grpc: {
+                            endpoints: [{ address: "http://localhost:5678" }],
+                            store_type: "cas",
+                        },
+                    },
+                ],
+                servers: [],
+            }"#,
+        )
+        .unwrap();
+
+        // The AC-store setting is inert: it neither compresses AC RPCs nor
+        // expresses process-wide zstd intent, so the CAS store stays unset.
+        assert_eq!(
+            grpc_compression_configs(&config),
+            vec![(false, Some(true)), (true, None)]
+        );
+        assert!(logs_contain("store=\"action-cache\""));
+        assert!(logs_contain("no effect"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn capabilities_zstd_intent_defaults_nested_cas_grpc_and_warns_on_opt_out() {
+        let config = CasConfig::try_from_json5_str(
+            r#"{
+                stores: [{
+                    name: "nested-upstreams",
+                    fast_slow: {
+                        fast: {
+                            grpc: {
+                                instance_name: "auto",
+                                endpoints: [{ address: "http://localhost:1234" }],
+                                store_type: "cas",
+                            },
+                        },
+                        slow: {
+                            shard: {
+                                stores: [
+                                    {
+                                        store: {
+                                            grpc: {
+                                                instance_name: "opt-out",
+                                                endpoints: [{
+                                                    address: "http://localhost:5678",
+                                                }],
+                                                store_type: "cas",
+                                                experimental_remote_cache_compression: false,
+                                            },
+                                        },
+                                        weight: 1,
+                                    },
+                                    {
+                                        store: {
+                                            grpc: {
+                                                instance_name: "action-cache",
+                                                endpoints: [{
+                                                    address: "http://localhost:9012",
+                                                }],
+                                                store_type: "ac",
+                                            },
+                                        },
+                                        weight: 1,
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                }],
+                servers: [{
+                    listener: {
+                        http: { socket_address: "127.0.0.1:50051" },
+                    },
+                    services: {
+                        capabilities: [{
+                            instance_name: "main",
+                            remote_cache_compression: true,
+                        }],
+                    },
+                }],
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            grpc_compression_configs(&config),
+            vec![(true, Some(true)), (true, Some(false)), (false, None),]
+        );
+        assert!(logs_contain("store=\"nested-upstreams\""));
+        assert!(logs_contain("instance_name=\"opt-out\""));
+        assert!(logs_contain(CasConfig::ZSTD_COMPRESSION_DOCS_URL));
     }
 }

@@ -37,7 +37,7 @@ mod tests {
         EnvironmentSource, UploadActionResultConfig, UploadCacheResultsStrategy,
     };
     use nativelink_config::stores::{
-        FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
+        EvictionPolicy, FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
     };
     use nativelink_error::{Code, Error, ResultExt, make_input_err};
     use nativelink_macro::nativelink_test;
@@ -67,7 +67,8 @@ mod tests {
     };
     use nativelink_util::common::{DigestInfo, fs, make_temp_path};
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
-    use nativelink_util::store_trait::{Store, StoreLike};
+    use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+    use nativelink_worker::directory_cache::{DirectoryCache, DirectoryCacheConfig};
     #[cfg(target_os = "linux")]
     use nativelink_worker::namespace_utils;
     use nativelink_worker::running_actions_manager::{
@@ -103,10 +104,24 @@ mod tests {
         ),
         Error,
     > {
+        setup_stores_with_eviction_policy(None).await
+    }
+
+    async fn setup_stores_with_eviction_policy(
+        eviction_policy: Option<EvictionPolicy>,
+    ) -> Result<
+        (
+            Arc<FilesystemStore>,
+            Arc<MemoryStore>,
+            Arc<FastSlowStore>,
+            Arc<MemoryStore>,
+        ),
+        Error,
+    > {
         let fast_config = FilesystemSpec {
             content_path: make_temp_path("content_path"),
             temp_path: make_temp_path("temp_path"),
-            eviction_policy: None,
+            eviction_policy,
             ..Default::default()
         };
         let slow_config = MemorySpec::default();
@@ -255,6 +270,288 @@ mod tests {
                 FILE2_MTIME
             );
         }
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn active_action_input_lease_survives_fast_store_pressure()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_CONTENT: &[u8] = b"leased input";
+        const PRESSURE_CONTENT: &[u8] = b"pressure";
+
+        let (fast_store, slow_store, cas_store, _ac_store) =
+            setup_stores_with_eviction_policy(Some(EvictionPolicy {
+                max_count: 1,
+                ..Default::default()
+            }))
+            .await?;
+
+        let file_digest = DigestInfo::new([7u8; 32], FILE_CONTENT.len() as u64);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, FILE_CONTENT.into())
+            .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory {
+                files: vec![FileNode {
+                    name: "input.txt".to_string(),
+                    digest: Some(file_digest.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slow_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let command_digest = serialize_and_upload_message(
+            &Command::default(),
+            slow_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action_digest = serialize_and_upload_message(
+            &Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            },
+            slow_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let operation_id = OperationId::default().to_string();
+
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let directory_cache = Arc::new(
+            DirectoryCache::new(
+                DirectoryCacheConfig {
+                    cache_root: make_temp_path("directory_cache").into(),
+                    ..Default::default()
+                },
+                cas_store.clone(),
+            )
+            .await?,
+        );
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::from_mins(10),
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                timeout_handled_externally: false,
+                active_input_leases: true,
+                directory_cache: Some(directory_cache),
+                #[cfg(target_os = "linux")]
+                use_namespaces: use_namespaces(),
+            })?);
+
+        let action = running_actions_manager
+            .create_and_add_action(
+                "test-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
+                        ..Default::default()
+                    }),
+                    operation_id: operation_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .prepare_action()
+            .await?;
+
+        let pressure_digest = DigestInfo::new([8u8; 32], PRESSURE_CONTENT.len() as u64);
+        fast_store
+            .as_ref()
+            .update_oneshot(pressure_digest, PRESSURE_CONTENT.into())
+            .await?;
+        assert!(
+            fast_store
+                .as_ref()
+                .has(StoreKey::Digest(file_digest))
+                .await?
+                .is_some(),
+            "an active action input must survive fast-tier pressure",
+        );
+
+        let duplicate_result = running_actions_manager
+            .create_and_add_action(
+                "test-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
+                        ..Default::default()
+                    }),
+                    operation_id,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let duplicate_error =
+            duplicate_result.expect_err("a duplicate operation id must be rejected");
+        assert_eq!(duplicate_error.code, Code::AlreadyExists);
+        assert!(
+            fs::metadata(action.get_work_directory()).await.is_ok(),
+            "a duplicate operation must not remove the active action directory",
+        );
+
+        let action = action.cleanup().await?;
+        let second_pressure_digest = DigestInfo::new([9u8; 32], PRESSURE_CONTENT.len() as u64);
+        fast_store
+            .as_ref()
+            .update_oneshot(second_pressure_digest, PRESSURE_CONTENT.into())
+            .await?;
+        assert_eq!(
+            fast_store
+                .as_ref()
+                .has(StoreKey::Digest(file_digest))
+                .await?,
+            None,
+            "released action inputs must become ordinary eviction candidates",
+        );
+
+        drop(action);
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn action_inputs_stay_evictable_when_leases_disabled()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_CONTENT: &[u8] = b"unleased input";
+        const PRESSURE_CONTENT: &[u8] = b"pressure";
+        // High enough that action preparation never triggers eviction; the
+        // pressure loop below inserts this many fresh digests so every entry
+        // that predates it is evicted.
+        const MAX_COUNT: u64 = 10;
+
+        let (fast_store, slow_store, cas_store, _ac_store) =
+            setup_stores_with_eviction_policy(Some(EvictionPolicy {
+                max_count: MAX_COUNT,
+                ..Default::default()
+            }))
+            .await?;
+
+        let file_digest = DigestInfo::new([7u8; 32], FILE_CONTENT.len() as u64);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, FILE_CONTENT.into())
+            .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory {
+                files: vec![FileNode {
+                    name: "input.txt".to_string(),
+                    digest: Some(file_digest.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slow_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let command_digest = serialize_and_upload_message(
+            &Command::default(),
+            slow_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action_digest = serialize_and_upload_message(
+            &Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            },
+            slow_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let directory_cache = Arc::new(
+            DirectoryCache::new(
+                DirectoryCacheConfig {
+                    cache_root: make_temp_path("directory_cache").into(),
+                    ..Default::default()
+                },
+                cas_store.clone(),
+            )
+            .await?,
+        );
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::from_mins(10),
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                timeout_handled_externally: false,
+                active_input_leases: false,
+                directory_cache: Some(directory_cache),
+                #[cfg(target_os = "linux")]
+                use_namespaces: use_namespaces(),
+            })?);
+
+        let action = running_actions_manager
+            .create_and_add_action(
+                "test-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .prepare_action()
+            .await?;
+
+        for pressure_index in 0..MAX_COUNT {
+            let pressure_digest = DigestInfo::new(
+                [0x80 + u8::try_from(pressure_index)?; 32],
+                PRESSURE_CONTENT.len() as u64,
+            );
+            fast_store
+                .as_ref()
+                .update_oneshot(pressure_digest, PRESSURE_CONTENT.into())
+                .await?;
+        }
+        assert_eq!(
+            fast_store
+                .as_ref()
+                .has(StoreKey::Digest(file_digest))
+                .await?,
+            None,
+            "with active input leases disabled, the fast tier must honor its eviction limits even while an action is running",
+        );
+
+        let action = action.cleanup().await?;
+        drop(action);
         Ok(())
     }
 
@@ -586,6 +883,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -645,6 +943,7 @@ mod tests {
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -712,6 +1011,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -773,6 +1073,7 @@ mod tests {
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -840,6 +1141,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -1024,6 +1326,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -1100,6 +1403,7 @@ mod tests {
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -1209,6 +1513,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -1280,6 +1585,7 @@ mod tests {
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -1463,6 +1769,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -1514,6 +1821,7 @@ mod tests {
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -1562,7 +1870,7 @@ mod tests {
             b"hello-from-outside".len()
         );
         // Verify the blob actually landed in CAS by re-reading it.
-        let key: nativelink_util::store_trait::StoreKey<'_> = uploaded.digest.into();
+        let key: StoreKey<'_> = uploaded.digest.into();
         let blob = slow_store.as_ref().get_part_unchunked(key, 0, None).await?;
         assert_eq!(blob.as_ref(), b"hello-from-outside");
         Ok(())
@@ -1615,6 +1923,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -1665,6 +1974,7 @@ mod tests {
             .await?;
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -1723,7 +2033,7 @@ mod tests {
             .clone()
             .expect("inner.txt must have a digest")
             .try_into()?;
-        let key: nativelink_util::store_trait::StoreKey<'_> = inner_digest.into();
+        let key: StoreKey<'_> = inner_digest.into();
         let blob = slow_store.as_ref().get_part_unchunked(key, 0, None).await?;
         assert_eq!(blob.as_ref(), b"inner-payload");
         Ok(())
@@ -1758,6 +2068,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -1811,6 +2122,7 @@ mod tests {
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -1896,6 +2208,7 @@ mod tests {
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -1962,6 +2275,7 @@ mod tests {
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -2102,6 +2416,7 @@ exit 0
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2145,6 +2460,7 @@ exit 0
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -2281,6 +2597,7 @@ exit 0
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2320,7 +2637,7 @@ exit 0
                 }],
             }),
             timeout: Some(prost_types::Duration {
-                seconds: TASK_TIMEOUT.as_secs() as i64,
+                seconds: TASK_TIMEOUT.as_secs().try_into().unwrap_or(i64::MAX),
                 nanos: 0,
             }),
             ..Default::default()
@@ -2334,6 +2651,7 @@ exit 0
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -2454,6 +2772,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2494,6 +2813,7 @@ exit 1
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -2544,6 +2864,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2622,6 +2943,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2707,6 +3029,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2813,6 +3136,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2863,6 +3187,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -2934,6 +3259,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -3028,7 +3354,7 @@ exit 1
                 command_digest: Some(command_digest.into()),
                 input_root_digest: Some(input_root_digest.into()),
                 timeout: Some(prost_types::Duration {
-                    seconds: TASK_TIMEOUT.as_secs() as i64,
+                    seconds: TASK_TIMEOUT.as_secs().try_into().unwrap_or(i64::MAX),
                     nanos: 0,
                 }),
                 ..Default::default()
@@ -3056,6 +3382,7 @@ exit 1
                     max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                     max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                     timeout_handled_externally: false,
+                    active_input_leases: false,
                     directory_cache: None,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
@@ -3074,6 +3401,7 @@ exit 1
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -3118,7 +3446,7 @@ exit 1
                 command_digest: Some(command_digest.into()),
                 input_root_digest: Some(input_root_digest.into()),
                 timeout: Some(prost_types::Duration {
-                    seconds: TASK_TIMEOUT.as_secs() as i64,
+                    seconds: TASK_TIMEOUT.as_secs().try_into().unwrap_or(i64::MAX),
                     nanos: 0,
                 }),
                 ..Default::default()
@@ -3146,6 +3474,7 @@ exit 1
                     max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                     max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                     timeout_handled_externally: false,
+                    active_input_leases: false,
                     directory_cache: None,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
@@ -3164,6 +3493,7 @@ exit 1
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -3208,7 +3538,7 @@ exit 1
                 command_digest: Some(command_digest.into()),
                 input_root_digest: Some(input_root_digest.into()),
                 timeout: Some(prost_types::Duration {
-                    seconds: TASK_TIMEOUT.as_secs() as i64,
+                    seconds: TASK_TIMEOUT.as_secs().try_into().unwrap_or(i64::MAX),
                     nanos: 0,
                 }),
                 ..Default::default()
@@ -3236,6 +3566,7 @@ exit 1
                     max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                     max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                     timeout_handled_externally: false,
+                    active_input_leases: false,
                     directory_cache: None,
                     #[cfg(target_os = "linux")]
                     use_namespaces: use_namespaces(),
@@ -3254,6 +3585,7 @@ exit 1
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -3323,6 +3655,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -3385,6 +3718,7 @@ exit 1
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -3474,6 +3808,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -3531,6 +3866,7 @@ exit 1
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -3642,6 +3978,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -3694,6 +4031,7 @@ exit 1
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -3715,6 +4053,130 @@ exit 1
         assert!(
             action_result.output_files[0].is_executable,
             "Expected output file to be executable"
+        );
+        Ok(())
+    }
+
+    /// Regression for skipping the `pre_exec` hook when namespaces are off.
+    /// With namespaces disabled (the default) the action spawn goes through
+    /// `posix_spawn` instead of `fork`, and `process_group(0)` must still make
+    /// the child its own process-group leader (pgid == pid).
+    #[cfg(target_os = "linux")]
+    #[nativelink_test]
+    async fn no_namespace_action_is_process_group_leader() -> Result<(), Box<dyn core::error::Error>>
+    {
+        const WORKER_ID: &str = "foo_worker_id";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                execution_configuration: ExecutionConfiguration::default(),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                timeout_handled_externally: false,
+                active_input_leases: false,
+                directory_cache: None,
+                // Pin namespaces off so this exercises the no-pre_exec/posix_spawn
+                // path regardless of what the host kernel supports.
+                use_namespaces: nativelink_worker::running_actions_manager::UseNamespaces::No,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Print the shell's own pid (field 1) and process-group id (field 5)
+        // from its /proc stat line; process_group(0) makes them equal.
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "read -r pid _ _ _ pgrp _ < /proc/$$/stat; printf '%s %s' \"$pid\" \"$pgrp\""
+                    .to_string(),
+            ],
+            output_paths: vec![],
+            working_directory: ".".to_string(),
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let action_result = run_action(running_action_impl.clone()).await?;
+        assert_eq!(
+            action_result.exit_code, 0,
+            "action should run to completion via posix_spawn"
+        );
+
+        let stdout = cas_store
+            .as_ref()
+            .get_part_unchunked(action_result.stdout_digest, 0, None)
+            .await?;
+        let stdout = from_utf8(&stdout)?;
+        let (pid, pgrp) = stdout.split_once(' ').expect("expected 'pid pgrp' output");
+        assert_eq!(
+            pid, pgrp,
+            "spawned process should be its own process-group leader (pid={pid} pgrp={pgrp})"
         );
         Ok(())
     }
@@ -3745,6 +4207,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -3792,6 +4255,7 @@ exit 1
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -3910,6 +4374,7 @@ exit 1
                     StartExecute {
                         execute_request: Some(ExecuteRequest {
                             action_digest: Some(action_digest.into()),
+                            digest_function: ProtoDigestFunction::Sha256.into(),
                             ..Default::default()
                         }),
                         operation_id: operation_id.to_string(),
@@ -3952,6 +4417,7 @@ exit 1
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4051,6 +4517,7 @@ done
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4118,6 +4585,7 @@ done
 
             let execute_request = ExecuteRequest {
                 action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
                 ..Default::default()
             };
             let operation_id = OperationId::default().to_string();
@@ -4234,6 +4702,7 @@ done
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4302,6 +4771,7 @@ done
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -4357,6 +4827,7 @@ done
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4393,6 +4864,7 @@ done
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
 
@@ -4501,6 +4973,7 @@ done
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4537,6 +5010,7 @@ done
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
 
@@ -4612,6 +5086,7 @@ done
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4670,6 +5145,7 @@ done
                 StartExecute {
                     execute_request: Some(ExecuteRequest {
                         action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
                         ..Default::default()
                     }),
                     operation_id,
@@ -4754,6 +5230,7 @@ done
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4823,6 +5300,7 @@ done
                 StartExecute {
                     execute_request: Some(ExecuteRequest {
                         action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
                         ..Default::default()
                     }),
                     operation_id: OperationId::default().to_string(),
@@ -4927,6 +5405,7 @@ done
                 max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
                 max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
                 timeout_handled_externally: false,
+                active_input_leases: false,
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
                 use_namespaces: use_namespaces(),
@@ -4939,6 +5418,7 @@ done
 
         let execute_request = ExecuteRequest {
             action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
             ..Default::default()
         };
         let operation_id = OperationId::default().to_string();
@@ -4992,10 +5472,204 @@ done
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn parse_cpu_ticks_from_stat_sums_user_and_system_time() {
+        use nativelink_worker::running_actions_manager::parse_cpu_ticks_from_stat;
+        // Fields after the final ')': state ppid pgrp session tty tpgid flags
+        // minflt cminflt majflt cmajflt utime stime ...
+        // utime = 120, stime = 34, so 154 ticks.
+        assert_eq!(
+            parse_cpu_ticks_from_stat(
+                "315 (perl) S 1 60 60 0 -1 0 100 0 200 0 120 34 7 9 20 0 1 0"
+            ),
+            Some(154)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cpu_ticks_from_stat_handles_comm_with_spaces_and_parens() {
+        use nativelink_worker::running_actions_manager::parse_cpu_ticks_from_stat;
+        // Same trap as the pgid parser: a `comm` containing ')' would shift
+        // every field if parsed from the left.
+        assert_eq!(
+            parse_cpu_ticks_from_stat(
+                "1234 (weird )( name) R 1 777 777 0 -1 0 1 2 3 4 11 22 0 0 0 0"
+            ),
+            Some(33)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cpu_ticks_from_stat_rejects_malformed_input() {
+        use nativelink_worker::running_actions_manager::parse_cpu_ticks_from_stat;
+        assert_eq!(parse_cpu_ticks_from_stat("no parenthesis here"), None);
+        // Truncated before utime.
+        assert_eq!(
+            parse_cpu_ticks_from_stat("123 (only) S 1 60 60 0 -1 0"),
+            None
+        );
+        assert_eq!(parse_cpu_ticks_from_stat(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn parse_pgid_from_stat_rejects_malformed_input() {
         use nativelink_worker::running_actions_manager::parse_pgid_from_stat;
         assert_eq!(parse_pgid_from_stat("no parenthesis here"), None);
         assert_eq!(parse_pgid_from_stat("123 (only) S"), None); // too few fields
         assert_eq!(parse_pgid_from_stat(""), None);
+    }
+
+    // Regression test for #2636: deeply nested directories with a single
+    // semaphore permit previously deadlocked because dir_futures and
+    // file_futures competed for the same permit inside try_join3.
+    // The fix awaits dir_futures first so permits are released before
+    // file/symlink uploads begin.
+
+    #[nativelink_test]
+    #[cfg(target_family = "unix")]
+    async fn upload_with_single_permit_nested_dirs() -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        // Take all but one FD permit away to trigger the deadlock scenario.
+        let _permits = stream::iter(1..fs::OPEN_FILE_SEMAPHORE.available_permits())
+            .then(|_| fs::OPEN_FILE_SEMAPHORE.acquire())
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(1, fs::OPEN_FILE_SEMAPHORE.available_permits());
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                timeout_handled_externally: false,
+                active_input_leases: false,
+                directory_cache: None,
+                #[cfg(target_os = "linux")]
+                use_namespaces: use_namespaces(),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Create 3-level nested dirs: out/a/b/ with files at each level.
+        // This exercises recursive upload_directory under permit starvation.
+        let arguments = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            concat!(
+                "mkdir -p ./out/a/b && ",
+                "printf 'root ' > ./out/root.txt && ",
+                "printf 'mid ' > ./out/a/mid.txt && ",
+                "printf 'leaf ' > ./out/a/b/leaf.txt && ",
+                "printf 'ok-stdout '; >&2 printf 'ok-stderr '"
+            )
+            .to_string(),
+        ];
+        let working_directory = "some_cwd";
+        let command = Command {
+            arguments,
+            output_paths: vec!["out".to_string()],
+            working_directory: working_directory.to_string(),
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory {
+                directories: vec![DirectoryNode {
+                    name: working_directory.to_string(),
+                    digest: Some(
+                        serialize_and_upload_message(
+                            &Directory::default(),
+                            cas_store.as_pin(),
+                            &mut DigestHasherFunc::Sha256.hasher(),
+                        )
+                        .await?
+                        .into(),
+                    ),
+                }],
+                ..Default::default()
+            },
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Sha256.into(),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                },
+            )
+            .await?;
+
+        // This would deadlock before the fix in #2636 because nested
+        // dir_futures and file_futures would compete for the single permit.
+        let action_result = run_action(running_action_impl.clone()).await?;
+
+        assert_eq!(action_result.exit_code, 0, "action should succeed");
+        // Verify the nested directory tree was uploaded.
+        assert_eq!(
+            action_result.output_folders.len(),
+            1,
+            "expected one output directory"
+        );
+        assert_eq!(action_result.output_folders[0].path, "out");
+        Ok(())
     }
 }

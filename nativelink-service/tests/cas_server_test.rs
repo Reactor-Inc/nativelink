@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use nativelink_config::cas_server::WithInstanceName;
-use nativelink_config::stores::{MemorySpec, StoreSpec};
+use nativelink_config::stores::{MemorySpec, StoreSpec, ZstdConfig};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
@@ -38,13 +38,15 @@ use nativelink_service::cas_server::CasServer;
 use nativelink_service::wire_compression::RemoteCacheCompressionInstances;
 use nativelink_store::ac_utils::serialize_and_upload_message;
 use nativelink_store::default_store_factory::store_factory;
+use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
+use nativelink_store::zstd_store::ZstdStore;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
-use nativelink_util::common::DigestInfo;
+use nativelink_util::common::{DigestInfo, make_temp_path};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    RemoveCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use pretty_assertions::assert_eq;
 use prost::Message;
@@ -138,7 +140,7 @@ async fn store_one_item_existence() -> Result<(), Box<dyn core::error::Error>> {
             instance_name: INSTANCE_NAME.to_string(),
             blob_digests: vec![Digest {
                 hash: HASH1.to_string(),
-                size_bytes: VALUE.len() as i64,
+                size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
             }],
             digest_function: digest_function::Value::Sha256.into(),
         }))
@@ -166,15 +168,15 @@ async fn has_three_requests_one_bad_hash() -> Result<(), Box<dyn core::error::Er
             blob_digests: vec![
                 Digest {
                     hash: HASH1.to_string(),
-                    size_bytes: VALUE.len() as i64,
+                    size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
                 },
                 Digest {
                     hash: BAD_HASH.to_string(),
-                    size_bytes: VALUE.len() as i64,
+                    size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
                 },
                 Digest {
                     hash: HASH1.to_string(),
-                    size_bytes: VALUE.len() as i64,
+                    size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
                 },
             ],
             digest_function: digest_function::Value::Sha256.into(),
@@ -199,7 +201,7 @@ async fn update_existing_item() -> Result<(), Box<dyn core::error::Error>> {
 
     let digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: VALUE2.len() as i64,
+        size_bytes: VALUE2.len().try_into().unwrap_or(i64::MAX),
     };
 
     store
@@ -256,11 +258,11 @@ async fn batch_read_blobs_read_two_blobs_success_one_fail()
 
     let digest1 = Digest {
         hash: HASH1.to_string(),
-        size_bytes: VALUE1.len() as i64,
+        size_bytes: VALUE1.len().try_into().unwrap_or(i64::MAX),
     };
     let digest2 = Digest {
         hash: HASH2.to_string(),
-        size_bytes: VALUE2.len() as i64,
+        size_bytes: VALUE2.len().try_into().unwrap_or(i64::MAX),
     };
     {
         // Insert dummy data.
@@ -614,11 +616,11 @@ async fn batch_update_blobs_two_items_existence_with_third_missing()
 
     let digest1 = Digest {
         hash: HASH1.to_string(),
-        size_bytes: VALUE1.len() as i64,
+        size_bytes: VALUE1.len().try_into().unwrap_or(i64::MAX),
     };
     let digest2 = Digest {
         hash: HASH2.to_string(),
-        size_bytes: VALUE2.len() as i64,
+        size_bytes: VALUE2.len().try_into().unwrap_or(i64::MAX),
     };
 
     {
@@ -679,12 +681,12 @@ async fn batch_update_blobs_two_items_existence_with_third_missing()
                 blob_digests: vec![
                     Digest {
                         hash: HASH1.to_string(),
-                        size_bytes: VALUE1.len() as i64,
+                        size_bytes: VALUE1.len().try_into().unwrap_or(i64::MAX),
                     },
                     missing_digest.clone(),
                     Digest {
                         hash: HASH2.to_string(),
-                        size_bytes: VALUE2.len() as i64,
+                        size_bytes: VALUE2.len().try_into().unwrap_or(i64::MAX),
                     },
                 ],
                 digest_function: digest_function::Value::Sha256.into(),
@@ -752,10 +754,7 @@ impl StoreDriver for StallStore {
         self
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, _callback: RemoveCallback) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -789,7 +788,7 @@ async fn batch_update_blobs_per_blob_timeout_returns_deadline_exceeded()
 
     let digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: VALUE.len() as i64,
+        size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
     };
     let raw_response = cas_server
         .batch_update_blobs(Request::new(BatchUpdateBlobsRequest {
@@ -921,7 +920,7 @@ async fn batch_update_blobs_zstd_rejected_when_remote_cache_compression_disabled
     let compressed_data = zstd::bulk::compress(raw_data, 3)?;
     let digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: raw_data.len() as i64,
+        size_bytes: raw_data.len().try_into().unwrap_or(i64::MAX),
     };
 
     let Err(status) = cas_server
@@ -958,7 +957,7 @@ async fn batch_read_blobs_zstd_compressed() -> Result<(), Box<dyn core::error::E
 
     // Upload uncompressed data first.
     let raw_data: Vec<u8> = "hello world ".repeat(100).into_bytes();
-    let raw_size = raw_data.len() as i64;
+    let raw_size = raw_data.len().try_into().unwrap_or(i64::MAX);
 
     // Compute the sha256 digest.
     let mut hasher = DigestHasherFunc::Sha256.hasher();
@@ -1012,7 +1011,7 @@ async fn batch_read_blobs_zstd_falls_back_to_identity_when_not_smaller()
 
     let digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: raw_data.len() as i64,
+        size_bytes: raw_data.len().try_into().unwrap_or(i64::MAX),
     };
     let response = cas_server
         .batch_read_blobs(Request::new(BatchReadBlobsRequest {
@@ -1031,6 +1030,387 @@ async fn batch_read_blobs_zstd_falls_back_to_identity_when_not_smaller()
     assert_eq!(entry.compressor, compressor::Value::Identity as i32);
     assert_eq!(entry.data, raw_data);
 
+    Ok(())
+}
+
+/// A passthrough zstd configuration over an in-memory backend with no
+/// recompression.
+fn zstd_instance_spec(temp_path: String) -> ZstdConfig {
+    ZstdConfig {
+        temp_path,
+        max_compressed_upload_size: 512 * 1024 * 1024,
+        ..ZstdConfig::default()
+    }
+}
+
+/// Builds a zstd-compressing `CasServer` over memory with wire compression
+/// enabled, returning the concrete store so tests can seed it directly.
+fn make_zstd_instance_cas_server() -> Result<(CasServer, Arc<ZstdStore>), Error> {
+    let temp_path = make_temp_path("cas_server_zstd_instance");
+    std::fs::create_dir_all(&temp_path).expect("create temp dir");
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let zstd_store = ZstdStore::new(&zstd_instance_spec(temp_path), inner)?;
+    let store_manager = Arc::new(StoreManager::new());
+    store_manager.add_store("main_cas", Store::new(zstd_store.clone()))?;
+    let cas_server = make_cas_server_with_zstd(&store_manager)?;
+    Ok((cas_server, zstd_store))
+}
+
+fn sha256_digest(data: &[u8]) -> (DigestInfo, Digest) {
+    let mut hasher = DigestHasherFunc::Sha256.hasher();
+    DigestHasher::update(&mut hasher, data);
+    let digest_info = hasher.finalize_digest();
+    let digest = Digest::from(&digest_info);
+    (digest_info, digest)
+}
+
+/// High-entropy (incompressible) bytes generated by a deterministic xorshift.
+fn incompressible_bytes(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+#[nativelink_test]
+async fn batch_read_zstd_instance_passthrough_and_identity()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (cas_server, zstd_store) = make_zstd_instance_cas_server()?;
+
+    // Compressible blob: seed the store with the client's zstd bytes verbatim
+    // (level 19, which the passthrough store keeps as-is).
+    let raw: Vec<u8> = "hello world ".repeat(100).into_bytes();
+    let (raw_di, raw_digest) = sha256_digest(&raw);
+    let stored_zstd = zstd::bulk::compress(&raw, 19)?;
+    zstd_store
+        .update_zstd_oneshot(
+            raw_di,
+            DigestHasherFunc::Sha256,
+            Bytes::from(stored_zstd.clone()),
+        )
+        .await?;
+
+    // Incompressible blob: store it via the identity path so the physical zstd
+    // bytes are larger than the raw size.
+    let incompressible = incompressible_bytes(8192);
+    let (inc_di, inc_digest) = sha256_digest(&incompressible);
+    Store::new(zstd_store.clone())
+        .update_oneshot(inc_di, Bytes::from(incompressible.clone()))
+        .await?;
+
+    let response = cas_server
+        .batch_read_blobs(Request::new(BatchReadBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            digests: vec![raw_digest.clone(), inc_digest.clone()],
+            acceptable_compressors: vec![compressor::Value::Zstd.into()],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.responses.len(), 2);
+    let compressible = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&raw_digest))
+        .expect("compressible response present");
+    assert_eq!(compressible.compressor, compressor::Value::Zstd as i32);
+    // Byte-for-byte passthrough of the stored zstd stream, no recompression.
+    assert_eq!(compressible.data.as_ref(), stored_zstd.as_slice());
+    assert_eq!(
+        zstd::bulk::decompress(&compressible.data, raw.len())?,
+        raw,
+        "stored zstd must decode to the original bytes"
+    );
+
+    let incompressible_resp = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&inc_digest))
+        .expect("incompressible response present");
+    assert_eq!(
+        incompressible_resp.compressor,
+        compressor::Value::Identity as i32,
+        "incompressible blob must not regress to a larger zstd response"
+    );
+    assert_eq!(incompressible_resp.data.as_ref(), incompressible.as_slice());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn batch_read_zstd_instance_error_isolation() -> Result<(), Box<dyn core::error::Error>> {
+    let (cas_server, zstd_store) = make_zstd_instance_cas_server()?;
+
+    let raw: Vec<u8> = "compress me ".repeat(64).into_bytes();
+    let (raw_di, present_digest) = sha256_digest(&raw);
+    let stored_zstd = zstd::bulk::compress(&raw, 3)?;
+    zstd_store
+        .update_zstd_oneshot(raw_di, DigestHasherFunc::Sha256, Bytes::from(stored_zstd))
+        .await?;
+
+    let absent_digest = Digest {
+        hash: HASH3.to_string(),
+        size_bytes: 5,
+    };
+
+    let response = cas_server
+        .batch_read_blobs(Request::new(BatchReadBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            digests: vec![present_digest.clone(), absent_digest.clone()],
+            acceptable_compressors: vec![compressor::Value::Zstd.into()],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.responses.len(), 2);
+    let present = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&present_digest))
+        .expect("present response");
+    assert_eq!(present.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(present.compressor, compressor::Value::Zstd as i32);
+
+    let absent = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&absent_digest))
+        .expect("absent response");
+    let status = absent.status.as_ref().expect("status set");
+    assert_eq!(status.code, Code::NotFound as i32);
+    assert_eq!(
+        status.message,
+        format!(
+            "Key {:?} not found",
+            StoreKey::from(DigestInfo::try_from(absent_digest)?)
+        ),
+        "NotFound message should be trimmed to a single message"
+    );
+    assert!(absent.data.is_empty());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn batch_update_zstd_instance_roundtrip_and_corrupt_isolation()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (cas_server, _zstd_store) = make_zstd_instance_cas_server()?;
+
+    // Valid zstd entry.
+    let good_raw: Vec<u8> = "round trip ".repeat(80).into_bytes();
+    let (_good_di, good_digest) = sha256_digest(&good_raw);
+    let good_compressed = zstd::bulk::compress(&good_raw, 3)?;
+
+    // Corrupt entry: valid zstd of some bytes but with a digest whose hash does
+    // not match the content (decodes to the wrong hash).
+    let bad_raw = b"totally different content".to_vec();
+    let bad_compressed = zstd::bulk::compress(&bad_raw, 3)?;
+    let bad_digest = Digest {
+        hash: HASH1.to_string(),
+        size_bytes: i64::try_from(bad_raw.len()).unwrap(),
+    };
+
+    let response = cas_server
+        .batch_update_blobs(Request::new(BatchUpdateBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            requests: vec![
+                batch_update_blobs_request::Request {
+                    digest: Some(good_digest.clone()),
+                    data: good_compressed.into(),
+                    compressor: compressor::Value::Zstd.into(),
+                },
+                batch_update_blobs_request::Request {
+                    digest: Some(bad_digest.clone()),
+                    data: bad_compressed.into(),
+                    compressor: compressor::Value::Zstd.into(),
+                },
+            ],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.responses.len(), 2);
+    let good = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&good_digest))
+        .expect("good response");
+    assert_eq!(
+        good.status.as_ref().map(|s| s.code),
+        Some(0),
+        "valid zstd entry should succeed: {:?}",
+        good.status
+    );
+    let bad = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&bad_digest))
+        .expect("bad response");
+    assert_eq!(
+        bad.status.as_ref().map(|s| s.code),
+        Some(Code::InvalidArgument as i32),
+        "corrupt entry should be InvalidArgument, got {:?}",
+        bad.status
+    );
+
+    // The valid entry round-trips byte-for-byte on read.
+    let read = cas_server
+        .batch_read_blobs(Request::new(BatchReadBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            digests: vec![good_digest.clone()],
+            acceptable_compressors: vec![compressor::Value::Identity.into()],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(read.responses.len(), 1);
+    assert_eq!(read.responses[0].data.as_ref(), good_raw.as_slice());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn batch_update_zstd_instance_identity_entry_roundtrips()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (cas_server, _zstd_store) = make_zstd_instance_cas_server()?;
+
+    let raw: Vec<u8> = "identity entry ".repeat(50).into_bytes();
+    let (_di, digest) = sha256_digest(&raw);
+
+    let response = cas_server
+        .batch_update_blobs(Request::new(BatchUpdateBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            requests: vec![batch_update_blobs_request::Request {
+                digest: Some(digest.clone()),
+                data: raw.clone().into(),
+                compressor: compressor::Value::Identity.into(),
+            }],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(response.responses.len(), 1);
+    assert_eq!(
+        response.responses[0].status.as_ref().map(|s| s.code),
+        Some(0)
+    );
+
+    let read = cas_server
+        .batch_read_blobs(Request::new(BatchReadBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            digests: vec![digest.clone()],
+            acceptable_compressors: vec![compressor::Value::Identity.into()],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(read.responses.len(), 1);
+    assert_eq!(read.responses[0].data.as_ref(), raw.as_slice());
+    Ok(())
+}
+
+/// Builds the same zstd-compressing server with wire compression disabled.
+fn make_zstd_instance_cas_server_compression_disabled() -> Result<(CasServer, Arc<ZstdStore>), Error>
+{
+    let temp_path = make_temp_path("cas_server_zstd_instance_disabled");
+    std::fs::create_dir_all(&temp_path).expect("create temp dir");
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let zstd_store = ZstdStore::new(&zstd_instance_spec(temp_path), inner)?;
+    let store_manager = Arc::new(StoreManager::new());
+    store_manager.add_store("main_cas", Store::new(zstd_store.clone()))?;
+    let cas_server = make_cas_server(&store_manager)?;
+    Ok((cas_server, zstd_store))
+}
+
+#[nativelink_test]
+async fn batch_update_zstd_instance_rejected_when_remote_cache_compression_disabled()
+-> Result<(), Box<dyn core::error::Error>> {
+    // The wire-compression capability must not bypass the instance-level gate.
+    let (cas_server, _zstd_store) = make_zstd_instance_cas_server_compression_disabled()?;
+
+    let raw_data = b"zstd disabled batch update to zstd-backed instance";
+    let compressed_data = zstd::bulk::compress(raw_data, 3)?;
+    let digest = Digest {
+        hash: HASH1.to_string(),
+        size_bytes: i64::try_from(raw_data.len()).unwrap(),
+    };
+
+    let Err(status) = cas_server
+        .batch_update_blobs(Request::new(BatchUpdateBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            requests: vec![batch_update_blobs_request::Request {
+                digest: Some(digest),
+                data: compressed_data.into(),
+                compressor: compressor::Value::Zstd.into(),
+            }],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await
+    else {
+        panic!(
+            "zstd BatchUpdateBlobs to a ZstdStore-backed instance should fail when remote cache compression is disabled"
+        );
+    };
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("Remote cache compression is not supported"),
+        "unexpected error: {}",
+        status.message()
+    );
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn batch_update_zstd_instance_identity_stores_when_remote_cache_compression_disabled()
+-> Result<(), Box<dyn core::error::Error>> {
+    // Identity entries must be unaffected by the gate: they still store and
+    // round-trip through the same ZstdStore-backed, compression-disabled
+    // instance.
+    let (cas_server, _zstd_store) = make_zstd_instance_cas_server_compression_disabled()?;
+
+    let raw: Vec<u8> = "identity entry to disabled zstd instance "
+        .repeat(20)
+        .into_bytes();
+    let (_di, digest) = sha256_digest(&raw);
+
+    let response = cas_server
+        .batch_update_blobs(Request::new(BatchUpdateBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            requests: vec![batch_update_blobs_request::Request {
+                digest: Some(digest.clone()),
+                data: raw.clone().into(),
+                compressor: compressor::Value::Identity.into(),
+            }],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(response.responses.len(), 1);
+    assert_eq!(
+        response.responses[0].status.as_ref().map(|s| s.code),
+        Some(0)
+    );
+
+    let read = cas_server
+        .batch_read_blobs(Request::new(BatchReadBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            digests: vec![digest.clone()],
+            acceptable_compressors: vec![compressor::Value::Identity.into()],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(read.responses.len(), 1);
+    assert_eq!(read.responses[0].data.as_ref(), raw.as_slice());
     Ok(())
 }
 
@@ -1081,11 +1461,11 @@ fn make_chunking_cas_server_with_avg(
 async fn upload_test_chunks(store: &Store) -> Result<(Digest, Digest, Digest), Error> {
     let chunk1_digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: CHUNK1_VALUE.len() as i64,
+        size_bytes: CHUNK1_VALUE.len().try_into().unwrap_or(i64::MAX),
     };
     let chunk2_digest = Digest {
         hash: HASH2.to_string(),
-        size_bytes: CHUNK2_VALUE.len() as i64,
+        size_bytes: CHUNK2_VALUE.len().try_into().unwrap_or(i64::MAX),
     };
     store
         .update_oneshot(
@@ -1250,7 +1630,7 @@ async fn splice_blob_missing_chunk_returns_not_found() -> Result<(), Box<dyn cor
     // Only upload the first chunk.
     let chunk1_digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: CHUNK1_VALUE.len() as i64,
+        size_bytes: CHUNK1_VALUE.len().try_into().unwrap_or(i64::MAX),
     };
     store
         .update_oneshot(
@@ -1260,7 +1640,7 @@ async fn splice_blob_missing_chunk_returns_not_found() -> Result<(), Box<dyn cor
         .await?;
     let missing_chunk_digest = Digest {
         hash: HASH2.to_string(),
-        size_bytes: CHUNK2_VALUE.len() as i64,
+        size_bytes: CHUNK2_VALUE.len().try_into().unwrap_or(i64::MAX),
     };
     let mut hasher = DigestHasherFunc::Sha256.hasher();
     hasher.update(CHUNK1_VALUE.as_bytes());
@@ -1294,7 +1674,7 @@ async fn split_blob_absent_blob_returns_not_found() -> Result<(), Box<dyn core::
             instance_name: INSTANCE_NAME.to_string(),
             blob_digest: Some(Digest {
                 hash: HASH1.to_string(),
-                size_bytes: VALUE.len() as i64,
+                size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
             }),
             digest_function: digest_function::Value::Sha256.into(),
             chunking_function: chunking_function::Value::FastCdc2020.into(),
@@ -1319,7 +1699,7 @@ async fn split_and_splice_disabled_return_unimplemented() -> Result<(), Box<dyn 
 
     let digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: VALUE.len() as i64,
+        size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
     };
     let split_status = cas_server
         .split_blob(Request::new(SplitBlobRequest {
@@ -1408,7 +1788,7 @@ async fn split_blob_chunks_large_blob_on_demand_and_reuses_layout()
         .collect();
     let blob_digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: BLOB_SIZE as i64,
+        size_bytes: BLOB_SIZE.try_into().unwrap_or(i64::MAX),
     };
     store
         .update_oneshot(
@@ -1482,7 +1862,7 @@ async fn split_blob_falls_back_when_layout_unusable() -> Result<(), Box<dyn core
     let stale_layout = SplitBlobResponse {
         chunk_digests: vec![Digest {
             hash: HASH2.to_string(),
-            size_bytes: VALUE.len() as i64,
+            size_bytes: VALUE.len().try_into().unwrap_or(i64::MAX),
         }],
         chunking_function: chunking_function::Value::FastCdc2020.into(),
     };
@@ -1564,6 +1944,8 @@ async fn chunking_on_grpc_store_forbids_index_store() -> Result<(), Box<dyn core
                 use_legacy_resource_names: false,
                 headers: std::collections::HashMap::new(),
                 forward_headers: vec![],
+                experimental_read_batching: None,
+                experimental_remote_cache_compression: Some(false),
             }),
             &store_manager,
             None,
@@ -1597,7 +1979,7 @@ async fn chunking_on_grpc_store_forbids_index_store() -> Result<(), Box<dyn core
         "unexpected error: {error}"
     );
 
-    // Without an index_store the configuration is valid: SplitBlob and
+    // Without an `index_store` the configuration is valid: SplitBlob and
     // SpliceBlob are forwarded to the backend.
     CasServer::new(
         &make_config(None),
@@ -1609,7 +1991,7 @@ async fn chunking_on_grpc_store_forbids_index_store() -> Result<(), Box<dyn core
 
 #[nativelink_test]
 async fn max_chunk_count_limits_split_and_splice() -> Result<(), Box<dyn core::error::Error>> {
-    // avg 1024 (min allowed) with max_chunk_count 2: the 16 KiB test blob
+    // avg 1024 (min allowed) with `max_chunk_count` 2: the 16 KiB test blob
     // chunks to more than 2 pieces, so on-demand splitting must refuse.
     const AVG_CHUNK_SIZE: u64 = 1024;
     const BLOB_SIZE: usize = 16 * 1024;
@@ -1641,7 +2023,7 @@ async fn max_chunk_count_limits_split_and_splice() -> Result<(), Box<dyn core::e
         .collect();
     let blob_digest = Digest {
         hash: HASH1.to_string(),
-        size_bytes: BLOB_SIZE as i64,
+        size_bytes: BLOB_SIZE.try_into().unwrap_or(i64::MAX),
     };
     store
         .update_oneshot(
@@ -1690,7 +2072,7 @@ async fn max_chunk_count_limits_split_and_splice() -> Result<(), Box<dyn core::e
     Ok(())
 }
 
-// Bazel 9.1.1 with --digest_function=blake3 leaves digest_function unset in
+// Bazel 9.1.1 with --digest_function=blake3 leaves `digest_function` unset in
 // SplitBlob/SpliceBlob requests, which is length-ambiguous (SHA256 and
 // BLAKE3 are both 32 bytes). The server must infer the function instead of
 // assuming the default.
@@ -1708,7 +2090,7 @@ async fn chunking_infers_blake3_when_digest_function_unset()
     let blob_digest: Digest = hasher.finalize_digest().into();
 
     // Splice: the single chunk is the blob itself, uploaded under its
-    // BLAKE3 digest, with digest_function left unset.
+    // BLAKE3 digest, with `digest_function` left unset.
     store
         .update_oneshot(DigestInfo::try_from(blob_digest.clone())?, VALUE.into())
         .await?;
@@ -1745,5 +2127,163 @@ async fn chunking_infers_blake3_when_digest_function_unset()
         .await?
         .into_inner();
     assert_eq!(split_response.chunk_digests, vec![other_digest]);
+    Ok(())
+}
+
+/// Inner store that stalls indefinitely for one specific digest while serving
+/// every other digest from an inner `MemoryStore`. Used to prove a batch's
+/// per-blob timeout isolates a stalled sibling from a healthy one.
+#[derive(MetricsComponent)]
+struct SelectiveStallStore {
+    stall_digest: DigestInfo,
+    delay: Duration,
+    #[metric(group = "inner")]
+    inner: Store,
+}
+
+impl SelectiveStallStore {
+    fn stalls(&self, key: &StoreKey<'_>) -> bool {
+        matches!(key, StoreKey::Digest(d)
+            if d.packed_hash() == self.stall_digest.packed_hash()
+                && d.size_bytes() == self.stall_digest.size_bytes())
+    }
+}
+
+#[async_trait]
+impl StoreDriver for SelectiveStallStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn has_with_results(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.inner.has_with_results(keys, results).await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        reader: DropCloserReadHalf,
+        size_info: UploadSizeInfo,
+    ) -> Result<u64, Error> {
+        if self.stalls(&key) {
+            tokio::time::sleep(self.delay).await;
+            return Ok(0);
+        }
+        self.inner
+            .as_store_driver_pin()
+            .update(key, reader, size_info)
+            .await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        if self.stalls(&key) {
+            tokio::time::sleep(self.delay).await;
+            return Ok(());
+        }
+        self.inner
+            .as_store_driver_pin()
+            .get_part(key, writer, offset, length)
+            .await
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_remove_callback(self: Arc<Self>, _callback: RemoveCallback) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+default_health_status_indicator!(SelectiveStallStore);
+
+/// A batch update whose siblings are one healthy blob and one blob that stalls
+/// past `BATCH_PER_BLOB_TIMEOUT` isolates the two: the healthy blob commits
+/// (`Ok`), the stalled one fails with its own `DeadlineExceeded` status, and
+/// neither outcome affects the other.
+#[nativelink_test(start_paused = true)]
+async fn batch_update_per_blob_timeout_isolates_siblings() -> Result<(), Box<dyn core::error::Error>>
+{
+    let good_data = b"healthy sibling blob".to_vec();
+    let (good_di, good_digest) = sha256_digest(&good_data);
+    let stall_data = b"stalling sibling blob".to_vec();
+    let (stall_di, stall_digest) = sha256_digest(&stall_data);
+
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let store = Store::new(Arc::new(SelectiveStallStore {
+        stall_digest: stall_di,
+        delay: Duration::from_mins(2), // Longer than BATCH_PER_BLOB_TIMEOUT (30s).
+        inner: inner.clone(),
+    }));
+    let store_manager = Arc::new(StoreManager::new());
+    store_manager.add_store("main_cas", store)?;
+    let cas_server = make_cas_server(&store_manager)?;
+
+    let response = cas_server
+        .batch_update_blobs(Request::new(BatchUpdateBlobsRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            requests: vec![
+                batch_update_blobs_request::Request {
+                    digest: Some(good_digest.clone()),
+                    data: good_data.clone().into(),
+                    compressor: compressor::Value::Identity.into(),
+                },
+                batch_update_blobs_request::Request {
+                    digest: Some(stall_digest.clone()),
+                    data: stall_data.into(),
+                    compressor: compressor::Value::Identity.into(),
+                },
+            ],
+            digest_function: digest_function::Value::Sha256.into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.responses.len(), 2);
+    let good = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&good_digest))
+        .expect("healthy sibling response present");
+    assert_eq!(
+        good.status.as_ref().map(|s| s.code),
+        Some(Code::Ok as i32),
+        "healthy sibling must commit despite the stalled one: {:?}",
+        good.status
+    );
+    let stalled = response
+        .responses
+        .iter()
+        .find(|r| r.digest.as_ref() == Some(&stall_digest))
+        .expect("stalled sibling response present");
+    assert_eq!(
+        stalled.status.as_ref().map(|s| s.code),
+        Some(Code::DeadlineExceeded as i32),
+        "stalled sibling must surface its own DeadlineExceeded: {:?}",
+        stalled.status
+    );
+
+    // The healthy blob actually committed; the stalled one did not.
+    assert_eq!(inner.has(good_di).await?, Some(good_data.len() as u64));
+    assert_eq!(inner.has(stall_di).await?, None);
     Ok(())
 }

@@ -107,9 +107,8 @@ build --remote_timeout=600
 build --remote_executor=grpcs://TODO
 ```
 
-Replace all three `TODO`s with either your
-[dev.nativelink.com](https://dev.nativelink.com) credentials or your
-own cluster's endpoint. Concretely, filled in for a plain local
+Replace all three `TODO`s with your own cluster's endpoint.
+Concretely, filled in for a plain local
 cluster (no TLS, so `grpc://` instead of `grpcs://`, and no BES
 endpoint to point at) — this is the exact `user.bazelrc` used to
 produce the verified output in step 4 above:
@@ -120,7 +119,7 @@ build --remote_timeout=600
 build --remote_executor=grpc://127.0.0.1:50051
 ```
 
-A [dev.nativelink.com](https://dev.nativelink.com) or self-hosted
+A TLS-terminated self-hosted
 cluster looks the same shape, just with `grpcs://` and your cluster's
 real hostnames in place of `127.0.0.1:50051`, plus a `bes_backend`
 line if you want build results streamed there.
@@ -178,6 +177,24 @@ the same CAS your local Bazel reads from. Re-run and it's a cache hit.
   [`local-remote-execution/README.md`](https://github.com/TraceMachina/nativelink/blob/main/local-remote-execution/README.md)
   — it also covers verifying the setup against a Kubernetes cluster.
 </Callout>
+
+## FAQ
+
+<Accordions type="multiple">
+  <Accordion title="How is this different from the local cache and executor page?" id="how-is-this-different-from-the-local-cache-and-executor-page">
+    [Local cache and executor](/rbe/local-testing) validates the protocol
+    with whatever toolchain is on your `PATH` — it has no toolchain
+    opinion. This page pins the toolchain with Nix so local and remote
+    actions hash identically. Run that one first if you just want to see
+    `Execute` work.
+  </Accordion>
+  <Accordion title="Can I get LRE without Nix?" id="can-i-get-lre-without-nix">
+    No — the guarantee *is* the Nix pinning: every tool lives at a
+    content-addressed `/nix/store` path, which is what makes action
+    hashes match across machines. The server side, by contrast, runs fine
+    without Nix.
+  </Accordion>
+</Accordions>
 
 ## What's next
 

@@ -53,7 +53,7 @@ NativeLink is trusted in production environments to reduce costs and developer i
    - Utilizes remote resources to offload computational burden from local machines
    - Ensures consistency with a uniform, controlled build environment
 
-NativeLink seamlessly integrates with build tools that use the Remote Execution protocol, such as [Bazel](https://bazel.build), [Buck2](https://buck2.build), [Goma](https://chromium.googlesource.com/infra/goma/client/), and [Siso](https://chromium.googlesource.com/build/+/refs/heads/main/siso/README.md). CMake projects work too via [`recc`](https://buildgrid.gitlab.io/recc). See [Build CMake projects with NativeLink](https://nativelink.com/docs/rbe/cmake-recc). It supports Unix-based operating systems and Windows, ensuring broad compatibility across different development environments.
+NativeLink seamlessly integrates with build tools that use the Remote Execution protocol, such as [Bazel](https://bazel.build), [Buck2](https://buck2.build), [Goma](https://chromium.googlesource.com/infra/goma/client/), and [Siso](https://chromium.googlesource.com/build/+/refs/heads/main/siso/README.md). CMake projects work too via [`recc`](https://buildgrid.gitlab.io/recc). See [Build CMake projects with NativeLink](https://docs.nativelink.com/getting-started/other-build-systems/cmake-recc). It supports Unix-based operating systems and Windows, ensuring broad compatibility across different development environments.
 
 ## 🚀 Quickstart
 
@@ -145,7 +145,7 @@ Visit our [Contributing](https://github.com/tracemachina/nativelink/blob/main/CO
 
 ## 📜 License
 
-Copyright 2020–2025 Trace Machina, Inc.
+Copyright 2020–2026 Trace Machina, Inc.
 
 Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License.
 SPDX identifier: `FSL-1.1-Apache-2.0`.

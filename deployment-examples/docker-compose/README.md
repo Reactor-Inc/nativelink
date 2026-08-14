@@ -4,7 +4,7 @@ This guide explains how to run NativeLink with multiple workers using Docker Com
 
 ## Prerequisites
 
-- **Architecture**: This setup currently only works on **x86_64/amd64** architectures. ARM64/Apple Silicon isn't supported for the test client container.
+- **Architecture**: This setup supports **x86_64/amd64** and **ARM64** architectures, except for Apple Silicon, which is not supported by the test client container
 - **Google Cloud CLI**: If using the test client container from `gcr.io/bazel-public/bazel`, you'll need:
   1. [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) installed
   2. Authentication via `gcloud auth login`
@@ -121,6 +121,7 @@ services:
 ### Single Worker Setup
 - [`docker-compose.yml`](./docker-compose.yml) - Docker Compose file for single worker deployment
 - [`local-storage-cas.json5`](./local-storage-cas.json5) - Local storage CAS configuration for single worker
+- [`local-storage-cas-zstd.json5`](./local-storage-cas-zstd.json5) - Same, but the CAS selects `compression_algorithm.zstd` to keep blobs as zstd at rest for byte-for-byte `--remote_cache_compression` passthrough (see the file's header comment for the dedicated-namespace and placement rules)
 - [`scheduler.json5`](./scheduler.json5) - Scheduler configuration for single worker deployment
 - [`worker.json5`](./worker.json5) - Worker configuration for single worker deployment
 
